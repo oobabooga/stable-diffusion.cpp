@@ -74,12 +74,20 @@ static sd::Tensor<float> sd_tensor_split_2d(const sd::Tensor<float>& input, int 
     int64_t input_plane  = sd_tensor_plane_size(input);
     int64_t output_plane = sd_tensor_plane_size(output);
     int64_t plane_count  = input.numel() / input_plane;
-    for (int iy = 0; iy < height; iy++) {
-        for (int ix = 0; ix < width; ix++) {
-            int64_t src_xy = (ix + x) % input_width + input_width * ((iy + y) % input_height);
-            int64_t dst_xy = ix + width * iy;
-            for (int64_t plane = 0; plane < plane_count; ++plane) {
-                output[plane * output_plane + dst_xy] = input[plane * input_plane + src_xy];
+    // Plane-outer order: a plane is contiguous, so the inner loop streams instead of striding a
+    // whole plane per element (a video tile has frames x channels planes).
+    std::vector<int64_t> src_x(static_cast<size_t>(width));
+    for (int ix = 0; ix < width; ix++) {
+        src_x[ix] = (ix + x) % input_width;
+    }
+    for (int64_t plane = 0; plane < plane_count; ++plane) {
+        const float* src = input.data() + plane * input_plane;
+        float* dst       = output.data() + plane * output_plane;
+        for (int iy = 0; iy < height; iy++) {
+            const float* src_row = src + input_width * ((iy + y) % input_height);
+            float* dst_row       = dst + static_cast<int64_t>(width) * iy;
+            for (int ix = 0; ix < width; ix++) {
+                dst_row[ix] = src_row[src_x[ix]];
             }
         }
     }
@@ -112,26 +120,43 @@ static void sd_tensor_merge_2d(const sd::Tensor<float>& input,
         return x * x * x * (x * (6.0f * x - 15.0f) + 10.0f);
     };
 
-    for (int iy = y_skip; iy < height; iy++) {
-        for (int ix = x_skip; ix < width; ix++) {
-            int64_t src_xy = ix + width * iy;
-            int64_t ox     = (x + ix) % img_width;
-            int64_t oy     = (y + iy) % img_height;
-            int64_t dst_xy = ox + img_width * oy;
-            for (int64_t plane = 0; plane < plane_count; ++plane) {
-                float new_value = input[plane * input_plane + src_xy];
-                if (overlap_x > 0 || overlap_y > 0) {
-                    float old_value   = (*output)[plane * output_plane + dst_xy];
-                    const float x_f_0 = (circular_x || (overlap_x > 0 && x > 0)) ? (ix - x_skip) / float(overlap_x) : 1.f;
-                    const float x_f_1 = (circular_x || (overlap_x > 0 && x < (img_width - width))) ? (width - ix) / float(overlap_x) : 1.f;
-                    const float y_f_0 = (circular_y || (overlap_y > 0 && y > 0)) ? (iy - y_skip) / float(overlap_y) : 1.f;
-                    const float y_f_1 = (circular_y || (overlap_y > 0 && y < (img_height - height))) ? (height - iy) / float(overlap_y) : 1.f;
-                    const float x_f   = std::min(std::min(x_f_0, x_f_1), 1.f);
-                    const float y_f   = std::min(std::min(y_f_0, y_f_1), 1.f);
-                    (*output)[plane * output_plane + dst_xy] =
-                        old_value + new_value * smootherstep_f32(y_f) * smootherstep_f32(x_f);
-                } else {
-                    (*output)[plane * output_plane + dst_xy] = new_value;
+    // Weights depend on ix or iy only; precompute them and walk each contiguous plane row by row.
+    // Same arithmetic per element as the per-pixel form, so the result is bit-identical.
+    const bool blend = overlap_x > 0 || overlap_y > 0;
+    std::vector<float> wx, wy;
+    std::vector<int64_t> dst_x(static_cast<size_t>(width));
+    for (int64_t ix = x_skip; ix < width; ix++) {
+        dst_x[ix] = (x + ix) % img_width;
+    }
+    if (blend) {
+        wx.resize(static_cast<size_t>(width));
+        wy.resize(static_cast<size_t>(height));
+        for (int64_t ix = x_skip; ix < width; ix++) {
+            const float x_f_0 = (circular_x || (overlap_x > 0 && x > 0)) ? (ix - x_skip) / float(overlap_x) : 1.f;
+            const float x_f_1 = (circular_x || (overlap_x > 0 && x < (img_width - width))) ? (width - ix) / float(overlap_x) : 1.f;
+            wx[ix]            = smootherstep_f32(std::min(std::min(x_f_0, x_f_1), 1.f));
+        }
+        for (int64_t iy = y_skip; iy < height; iy++) {
+            const float y_f_0 = (circular_y || (overlap_y > 0 && y > 0)) ? (iy - y_skip) / float(overlap_y) : 1.f;
+            const float y_f_1 = (circular_y || (overlap_y > 0 && y < (img_height - height))) ? (height - iy) / float(overlap_y) : 1.f;
+            wy[iy]            = smootherstep_f32(std::min(std::min(y_f_0, y_f_1), 1.f));
+        }
+    }
+    for (int64_t plane = 0; plane < plane_count; ++plane) {
+        const float* src = input.data() + plane * input_plane;
+        float* dst       = output->data() + plane * output_plane;
+        for (int64_t iy = y_skip; iy < height; iy++) {
+            const float* src_row = src + width * iy;
+            float* dst_row       = dst + img_width * ((y + iy) % img_height);
+            if (blend) {
+                const float sy = wy[iy];
+                for (int64_t ix = x_skip; ix < width; ix++) {
+                    float& out = dst_row[dst_x[ix]];
+                    out        = out + src_row[ix] * sy * wx[ix];
+                }
+            } else {
+                for (int64_t ix = x_skip; ix < width; ix++) {
+                    dst_row[dst_x[ix]] = src_row[ix];
                 }
             }
         }
