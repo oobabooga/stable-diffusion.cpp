@@ -55,6 +55,14 @@ long-sequence variant of the ggml-cuda flash attention kernel (about 2x to 4x fa
 shapes; the arithmetic per output element is unchanged). `GGML_CUDA_FA_LONGSEQ=0` restores the
 stock kernel, `GGML_CUDA_FA_LONGSEQ_NCOLS=64|128` overrides the per-architecture tile width.
 
+The video VAE decodes several 16x16 latent tiles per decoder graph, sized from free device
+memory (at most 4 unless `SD_H3_VAE_TILE_BATCH_MAX` raises it; `SD_H3_VAE_TILE_BATCH=N` forces
+N, and 1 restores one graph per tile). Its weights stay on the device across temporal chunks
+(`SD_H3_VAE_KEEP_RESIDENT=0` releases them after every chunk), and the decoder blocks use a
+table-based rotary embedding and a fused SwiGLU (`SD_H3_VAE_GRAPH_OPT=0` restores the previous
+graph). Each tile still goes through its own attention call and the projections run as one
+matmul over all tiles' tokens, so the decoded frames are the same as with one tile per graph.
+
 ## First/last-frame conditioning
 
 Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:
