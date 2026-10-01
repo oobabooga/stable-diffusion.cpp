@@ -215,11 +215,14 @@ namespace MiniMaxH3 {
             auto h        = ggml_ext_linear_matmul(ctx->ggml_ctx, x, fc1->foldable_weight(ctx), fc1->prec_f32());
             auto halves   = ggml_ext_chunk(ctx->ggml_ctx, h, 2, 0, false);
 #ifdef SD_USE_UPSTREAM_GGML
+            GGML_UNUSED(s1);
+            GGML_UNUSED(s2);
+            GGML_UNUSED(halves);
             GGML_ABORT("forward_folded needs the fused swiglu op");
 #else
             auto gated = ggml_swiglu_scaled(ctx->ggml_ctx, halves[0], halves[1], s1 != 1.f ? 1.f / s1 : 1.f, s2);
-#endif
             return ggml_ext_linear_matmul(ctx->ggml_ctx, gated, fc2->foldable_weight(ctx), fc2->prec_f32());
+#endif
         }
 
         ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
