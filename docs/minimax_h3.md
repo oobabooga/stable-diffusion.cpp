@@ -51,9 +51,10 @@ most of its attention cost without touching the text encoder. Set `SD_H3_VAE_FLA
 to decode with the previous mul_mat + softmax attention.
 
 On NVIDIA GPUs from Ampere on, the unmasked DiT and VAE attention runs a pipelined
-long-sequence variant of the ggml-cuda flash attention kernel (about 2x to 4x faster at H3
+long-sequence variant of the ggml-cuda flash attention kernel (up to 4x faster at H3
 shapes; the arithmetic per output element is unchanged). `GGML_CUDA_FA_LONGSEQ=0` restores the
-stock kernel, `GGML_CUDA_FA_LONGSEQ_NCOLS=64|128` overrides the per-architecture tile width.
+stock kernel. `GGML_CUDA_FA_LONGSEQ_NCOLS=128` opts into a wider tile that is faster on A100 and L4
+but not bit-identical.
 
 The video VAE decodes several 16x16 latent tiles per decoder graph, sized from free device
 memory (at most 4 unless `SD_H3_VAE_TILE_BATCH_MAX` raises it; `SD_H3_VAE_TILE_BATCH=N` forces

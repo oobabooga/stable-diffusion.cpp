@@ -1,7 +1,7 @@
 From ed3f840655078aef3c2bb4e6b9a1d26f8e868e64 Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Thu, 1 Oct 2026 05:41:03 -0700
-Subject: [PATCH 1/2] ggml-cuda: pipelined long-sequence FlashAttention for
+Subject: [PATCH 1/3] ggml-cuda: pipelined long-sequence FlashAttention for
  unmasked attention without GQA packing
 
 The mma FlashAttention kernels without GQA packing (ncols2 == 1, used whenever
@@ -389,7 +389,7 @@ index fdf505cd..dd290caf 100644
 From 7f7c132c57dbfd8fd44a13dd29031c6724589efc Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Thu, 1 Oct 2026 06:27:44 -0700
-Subject: [PATCH 2/2] ggml-cuda: per-architecture tile width for the
+Subject: [PATCH 2/3] ggml-cuda: per-architecture tile width for the
  long-sequence FlashAttention variant
 
 Use 128 Q columns per block (8 warps sharing each K/V tile) by default for head
@@ -446,6 +446,118 @@ index 00e9554a..b8be30a0 100644
              ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 128, 1>(ctx, dst);
              return;
          }
+-- 
+2.43.0
+
+
+From e6e78b0ba7477be2b0e6869e19bf86ac89b0381b Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Thu, 1 Oct 2026 07:36:53 -0700
+Subject: [PATCH 3/3] ggml-cuda: long-sequence FlashAttention takes the stock
+ grid; 128-column tile opt-in only
+
+The stream-k grid is sized from occupancy, and the pipelined variant can have a
+different occupancy than the stock kernel (two-stage shared memory), which
+moves the stream-k seams and with them the order in which partial results are
+combined (measured on L4: relative L2 6e-4 at the op, 36 dB PSNR end to end
+over 4 diffusion steps). Size the grid from the stock kernel of the same tile
+instead, so the pipelined variant is a bit-identical drop-in on every GPU.
+
+The 128-column tile cannot match the stock seams, so it is no longer a default
+on any architecture; GGML_CUDA_FA_LONGSEQ_NCOLS=128 opts in.
+---
+ src/ggml-cuda/fattn-common.cuh  |  8 +++++--
+ src/ggml-cuda/fattn-mma-f16.cuh | 39 +++++++++++++++++++++++----------
+ 2 files changed, 33 insertions(+), 14 deletions(-)
+
+diff --git a/src/ggml-cuda/fattn-common.cuh b/src/ggml-cuda/fattn-common.cuh
+index e67cc7fd..8a8d4023 100644
+--- a/src/ggml-cuda/fattn-common.cuh
++++ b/src/ggml-cuda/fattn-common.cuh
+@@ -972,7 +972,10 @@ static __global__ void flash_attn_combine_results(
+ template <int DV, int ncols1, int ncols2>
+ void launch_fattn(
+     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
++    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
++    // Optional: size the grid from the occupancy of this kernel instead of fattn_kernel. A drop-in kernel variant launched
++    // with the grid of the kernel it replaces splits the work (stream-k seams) identically and so gives identical results.
++    fattn_kernel_t occupancy_kernel = nullptr, const size_t occupancy_nbytes_shared = 0
+ ) {
+     constexpr int ncols = ncols1 * ncols2;
+ 
+@@ -1110,7 +1113,8 @@ void launch_fattn(
+ 
+     const dim3 block_dim(warp_size, nwarps, 1);
+     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
+-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
++    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, occupancy_kernel ? occupancy_kernel : fattn_kernel,
++        block_dim.x * block_dim.y * block_dim.z, occupancy_kernel ? occupancy_nbytes_shared : nbytes_shared));
+     GGML_ASSERT(max_blocks_per_sm > 0);
+     int parallel_blocks = max_blocks_per_sm;
+ 
+diff --git a/src/ggml-cuda/fattn-mma-f16.cuh b/src/ggml-cuda/fattn-mma-f16.cuh
+index 57f284c6..d5fd8eea 100644
+--- a/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -1965,21 +1965,18 @@ static bool ggml_cuda_fattn_mma_longseq_arch_default(const int cc) {
+     return true;
+ }
+ 
+-// Q columns per CUDA block of the long-sequence variant for long Q: 64 (the stock tile) or 128 (8 warps sharing each K/V tile,
+-// half the K/V traffic per FLOP). GGML_CUDA_FA_LONGSEQ_NCOLS=64|128 overrides the per-architecture default.
+-// Measured at MiniMax-H3 DiT shapes (19108 tokens, 56 heads x 128): 128 is faster on A100 (sm80) and L4 (sm89), neutral on
+-// RTX PRO 6000 Blackwell (sm120) and B200 (sm100), and slower for head size 64 on A100, so it is only the default there.
++// Q columns per CUDA block of the long-sequence variant for long Q: 64 (the stock tile, default) or 128 (8 warps sharing
++// each K/V tile, half the K/V traffic per FLOP). 128 is opt-in via GGML_CUDA_FA_LONGSEQ_NCOLS=128: it was measured faster at
++// MiniMax-H3 DiT shapes on A100 (sm80, 75 -> 70 ms) and L4 (sm89, 460 -> 365 ms) but splits the work differently from the
++// stock kernel, so its results are not bit-identical.
+ static int ggml_cuda_fattn_mma_longseq_ncols(const int cc, const int DKQ) {
+     static const int env = [] {
+         const char * e = getenv("GGML_CUDA_FA_LONGSEQ_NCOLS");
+         return e != nullptr ? atoi(e) : -1;
+     }();
+-    if (env == 64 || env == 128) {
+-        return env;
+-    }
+-    const int arch = ggml_cuda_highest_compiled_arch(cc);
+-    return DKQ == 128 && (cc == GGML_CUDA_CC_AMPERE || cc == GGML_CUDA_CC_ADA_LOVELACE) &&
+-        (arch == GGML_CUDA_CC_AMPERE || arch == GGML_CUDA_CC_ADA_LOVELACE) ? 128 : 64;
++    GGML_UNUSED(cc);
++    GGML_UNUSED(DKQ);
++    return env == 128 ? 128 : 64;
+ }
+ 
+ static bool ggml_cuda_fattn_mma_use_longseq(const int cc, const ggml_tensor * dst) {
+@@ -2064,8 +2061,26 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
+                 CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+                 shared_memory_limit_raised[id] = true;
+             }
+-            launch_fattn<DV, ncols1, ncols2>
+-                (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host);
++            if (ncols1 <= 64) {
++                // Same grid as the stock kernel of this tile size: identical stream-k seams, so results are bit-identical.
++                const int    nstages_stock      = ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2, cc);
++                const size_t nbytes_KV_stock    = nstages_stock <= 1 ? nbytes_shared_KV_1stage : nbytes_shared_KV_2stage;
++                const size_t nbytes_total_stock = std::max(nbytes_shared_combine, Q_in_reg ?
++                    std::max(nbytes_shared_Q,  nbytes_KV_stock + nbytes_shared_mask) :
++                             nbytes_shared_Q + nbytes_KV_stock + nbytes_shared_mask);
++                fattn_kernel_t stock_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, false, false>;
++                static bool stock_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
++                if (!stock_limit_raised[id]) {
++                    CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(stock_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_total_stock));
++                    stock_limit_raised[id] = true;
++                }
++                launch_fattn<DV, ncols1, ncols2>
++                    (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host,
++                     stock_kernel, nbytes_total_stock);
++            } else {
++                launch_fattn<DV, ncols1, ncols2>
++                    (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, warp_size_host);
++            }
+             return;
+         }
+     }
 -- 
 2.43.0
 
