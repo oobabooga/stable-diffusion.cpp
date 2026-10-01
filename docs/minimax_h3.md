@@ -56,13 +56,14 @@ shapes; the arithmetic per output element is unchanged). `GGML_CUDA_FA_LONGSEQ=0
 stock kernel. `GGML_CUDA_FA_LONGSEQ_NCOLS=128` opts into a wider tile that is faster on A100 and L4
 but not bit-identical.
 
-The video VAE decodes several 16x16 latent tiles per decoder graph, sized from free device
-memory (at most 4 unless `SD_H3_VAE_TILE_BATCH_MAX` raises it; `SD_H3_VAE_TILE_BATCH=N` forces
-N, and 1 restores one graph per tile). Its weights stay on the device across temporal chunks
+The video VAE decodes one 16x16 latent tile per decoder graph by default.
+`SD_H3_VAE_TILE_BATCH=auto` puts several tiles into one graph, sized from free device memory (at
+most 4 unless `SD_H3_VAE_TILE_BATCH_MAX` raises it), and `SD_H3_VAE_TILE_BATCH=N` forces N; the
+batched projections can round differently from the per-tile decode on some GPUs, so it is
+opt-in. The decoder weights stay on the device across temporal chunks
 (`SD_H3_VAE_KEEP_RESIDENT=0` releases them after every chunk), and the decoder blocks use a
 table-based rotary embedding and a fused SwiGLU (`SD_H3_VAE_GRAPH_OPT=0` restores the previous
-graph). Each tile still goes through its own attention call and the projections run as one
-matmul over all tiles' tokens, so the decoded frames are the same as with one tile per graph.
+graph). Each batched tile still goes through its own attention call.
 
 The DiT blocks use fused ggml ops (CPU and CUDA) for the work around the matmuls and attention:
 partial RoPE with the attention relayout and the K/V scale and F16 cast, per-segment adaLN

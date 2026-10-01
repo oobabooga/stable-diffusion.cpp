@@ -900,11 +900,18 @@ namespace MiniMaxH3VAE {
             return output;
         }
 
-        // How many spatial tiles go into one decoder graph. SD_H3_VAE_TILE_BATCH=N forces N
-        // (1 restores one graph per tile); otherwise the first tile runs alone, its compute
-        // buffer is measured, and the batch is sized from the free device memory.
+        // How many spatial tiles go into one decoder graph. Default 1 (one graph per tile): the
+        // batched graph runs each projection as one matmul over all tiles' tokens, and cuBLAS may
+        // pick a different kernel for the larger M (seen on RTX PRO 6000 Blackwell: 53 dB PSNR vs
+        // the per-tile decode), while it measured no faster there. SD_H3_VAE_TILE_BATCH=N forces N,
+        // SD_H3_VAE_TILE_BATCH=auto runs the first tile alone, measures its compute buffer and sizes
+        // the batch from the free device memory.
         int resolve_tile_batch() {
-            int forced = env_int("SD_H3_VAE_TILE_BATCH", 0);
+            const char* mode = getenv("SD_H3_VAE_TILE_BATCH");
+            if (mode == nullptr || mode[0] == '\0') {
+                return 1;
+            }
+            int forced = strcmp(mode, "auto") == 0 ? 0 : atoi(mode);
             if (forced > 0) {
                 return forced;
             }
