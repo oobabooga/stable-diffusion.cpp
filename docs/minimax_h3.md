@@ -50,6 +50,11 @@ decoded audio track.
 most of its attention cost without touching the text encoder. Set `SD_H3_VAE_FLASH_ATTN=0`
 to decode with the previous mul_mat + softmax attention.
 
+On NVIDIA GPUs from Ampere on, the unmasked DiT and VAE attention runs a pipelined
+long-sequence variant of the ggml-cuda flash attention kernel (about 2x to 4x faster at H3
+shapes; the arithmetic per output element is unchanged). `GGML_CUDA_FA_LONGSEQ=0` restores the
+stock kernel, `GGML_CUDA_FA_LONGSEQ_NCOLS=64|128` overrides the per-architecture tile width.
+
 ## First/last-frame conditioning
 
 Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:
