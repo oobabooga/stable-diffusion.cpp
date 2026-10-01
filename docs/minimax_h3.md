@@ -46,6 +46,10 @@ are detected from their weights.
 Omitting `--audio-vae` still runs the joint diffusion model but produces video without a
 decoded audio track.
 
+`--diffusion-fa` also enables flash attention in the video VAE decoder (a ViT), which removes
+most of its attention cost without touching the text encoder. Set `SD_H3_VAE_FLASH_ATTN=0`
+to decode with the previous mul_mat + softmax attention.
+
 ## First/last-frame conditioning
 
 Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:

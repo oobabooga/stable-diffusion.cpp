@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <set>
@@ -1175,6 +1176,18 @@ bool StableDiffusionGGML::validate_and_load_runners() {
         diffusion_model->set_flash_attention_enabled(true);
         if (high_noise_diffusion_model) {
             high_noise_diffusion_model->set_flash_attention_enabled(true);
+        }
+    }
+    // The MiniMax-H3 video VAE decoder is a 36-layer ViT (32 x 64 heads, ~1.5k tokens per 16x16 latent tile).
+    // Without flash attention every tile and layer materialises a 32 x L x L f32 score matrix (mul_mat + scale +
+    // softmax + mul_mat), which is most of the decode's GPU time. --diffusion-fa therefore also covers it, the
+    // way --fa would, without switching the text encoder's attention. SD_H3_VAE_FLASH_ATTN=0 restores the old path.
+    if (!sd_ctx_params->flash_attn && sd_ctx_params->diffusion_flash_attn && first_stage_model &&
+        sd_version_is_minimax_h3(version)) {
+        const char* env = getenv("SD_H3_VAE_FLASH_ATTN");
+        if (env == nullptr || strcmp(env, "0") != 0) {
+            LOG_INFO("Using flash attention in the MiniMax-H3 video VAE");
+            first_stage_model->set_flash_attention_enabled(true);
         }
     }
     if (sd_ctx_params->sage_attn && !set_sage_attention_enabled(true)) {
