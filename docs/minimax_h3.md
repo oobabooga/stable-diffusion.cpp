@@ -63,7 +63,11 @@ batched projections can round differently from the per-tile decode on some GPUs,
 opt-in. The decoder weights stay on the device across temporal chunks
 (`SD_H3_VAE_KEEP_RESIDENT=0` releases them after every chunk), and the decoder blocks use a
 table-based rotary embedding and a fused SwiGLU (`SD_H3_VAE_GRAPH_OPT=0` restores the previous
-graph). Each batched tile still goes through its own attention call.
+graph). Each batched tile still goes through its own attention call. With one tile per graph and
+flash attention, each decoder attention normalises q/k in place on the projection and one fused
+RoPE op per tensor writes the head-major Q (F32) and K/V (F16) that the attention kernel reads,
+replacing the table RoPE, chunk copies, permutes and casts; the frames are bit-identical
+(`SD_H3_VAE_FUSED_QKV=0` restores the unfused graph).
 
 The host side of the decode overlaps the device: each tile's blend into the frame runs on a
 worker thread while the next tile computes (`SD_TILE_ASYNC_MERGE=0` blends inline; this applies

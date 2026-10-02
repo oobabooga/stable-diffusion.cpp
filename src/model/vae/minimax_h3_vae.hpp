@@ -289,6 +289,56 @@ namespace MiniMaxH3VAE {
             blocks["to_out"] = std::make_shared<Linear>(dim, dim, true);
         }
 
+        // Single-tile flash-attention decode: q/k RMS-normed in place on the projection, then one
+        // ggml_rope_pe_permute per tensor applies the partial RoPE, writes the head-major layout the
+        // attention kernel reads and casts K/V to F16. Same products, sums and casts as the table
+        // RoPE + chunk / permute / cast chain, so the result is bit-identical. Returns nullptr when
+        // it does not apply (SD_H3_VAE_FUSED_QKV=0 turns it off).
+        ggml_tensor* forward_head_major(GGMLRunnerContext* ctx,
+                                        ggml_tensor* qkv,
+                                        ggml_tensor* pe,
+                                        ggml_tensor* rope_a,
+                                        ggml_tensor* rope_b) {
+#ifdef SD_USE_UPSTREAM_GGML
+            return nullptr;
+#else
+            static const bool enabled = [] {
+                const char* v = getenv("SD_H3_VAE_FUSED_QKV");
+                return v == nullptr || v[0] == '\0' || atoi(v) != 0;
+            }();
+            // rope_a / rope_b are only passed with SD_H3_VAE_GRAPH_OPT on; that path is what this replaces
+            if (!enabled || rope_a == nullptr || rope_b == nullptr || pe == nullptr || ctx->backend == nullptr ||
+                !ctx->flash_attn_enabled || ctx->sage_attn_enabled || qkv->type != GGML_TYPE_F32 ||
+                qkv->ne[3] != 1 || qkv->nb[0] != sizeof(float)) {
+                return nullptr;
+            }
+            const int64_t sequence = qkv->ne[2];
+            const int n_rot        = static_cast<int>(pe->ne[2] * 2);
+            if (pe->type != GGML_TYPE_F32 || !ggml_is_contiguous(pe) || pe->ne[0] != 2 || pe->ne[1] != 2 ||
+                pe->ne[3] != sequence || n_rot > head_dim) {
+                return nullptr;
+            }
+            const float kv_scale = ctx->attn_scale > 0.f ? ctx->attn_scale : 1.f;
+            auto part            = [&](int index) {
+                return ggml_view_4d(ctx->ggml_ctx, qkv, head_dim, num_head, sequence, 1,
+                                    qkv->nb[1], qkv->nb[2], qkv->nb[3], index * head_dim * sizeof(float));
+            };
+            auto q = ggml_rms_norm(ctx->ggml_ctx, part(0), 1e-5f);
+            auto k = ggml_rms_norm(ctx->ggml_ctx, part(1), 1e-5f);
+            q      = ggml_rope_pe_permute(ctx->ggml_ctx, q, pe, n_rot, 1.f, GGML_TYPE_F32);
+            k      = ggml_rope_pe_permute(ctx->ggml_ctx, k, pe, n_rot, kv_scale, GGML_TYPE_F16);
+            auto v = ggml_rope_pe_permute(ctx->ggml_ctx, part(2), nullptr, 0, kv_scale, GGML_TYPE_F16);
+            if (!ggml_backend_supports_op(ctx->backend, q) || !ggml_backend_supports_op(ctx->backend, k) ||
+                !ggml_backend_supports_op(ctx->backend, v)) {
+                return nullptr;
+            }
+            q = ggml_reshape_3d(ctx->ggml_ctx, q, head_dim, sequence, num_head);
+            k = ggml_reshape_3d(ctx->ggml_ctx, k, head_dim, sequence, num_head);
+            v = ggml_reshape_3d(ctx->ggml_ctx, v, head_dim, sequence, num_head);
+            return ggml_ext_attention_prepared(ctx->ggml_ctx, ctx->backend, q, k, v, num_head, 1, kv_scale);
+#endif
+        }
+
         ggml_tensor* forward(GGMLRunnerContext* ctx,
                              ggml_tensor* x,
                              ggml_tensor* pe,
@@ -312,6 +362,9 @@ namespace MiniMaxH3VAE {
                                              num_head,
                                              sequence,
                                              batch_size);
+            if (auto fused = forward_head_major(ctx, qkv_projection, pe, rope_a, rope_b)) {
+                return project_out(fused);
+            }
             auto qkv       = ggml_ext_chunk(ctx->ggml_ctx, qkv_projection, 3, 0);
             auto q         = ggml_reshape_4d(ctx->ggml_ctx,
                                              qkv[0],
