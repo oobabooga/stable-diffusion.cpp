@@ -67,7 +67,9 @@ graph). Each batched tile still goes through its own attention call. With one ti
 flash attention, each decoder attention normalises q/k in place on the projection and one fused
 RoPE op per tensor writes the head-major Q (F32) and K/V (F16) that the attention kernel reads,
 replacing the table RoPE, chunk copies, permutes and casts; the frames are bit-identical
-(`SD_H3_VAE_FUSED_QKV=0` restores the unfused graph).
+(`SD_H3_VAE_FUSED_QKV=0` restores the unfused graph). On CUDA the q/k RMS norm runs inside that
+RoPE op with the same reduction as the standalone norm (`SD_H3_VAE_FUSED_QK_NORM=0` keeps it
+separate).
 
 The host side of the decode overlaps the device: each tile's blend into the frame runs on a
 worker thread while the next tile computes (`SD_TILE_ASYNC_MERGE=0` blends inline; this applies
