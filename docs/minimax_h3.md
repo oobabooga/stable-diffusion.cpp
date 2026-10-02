@@ -84,6 +84,12 @@ F32 Q/K and F16 V layout the sage kernel reads (K and V carry the kv scale), so 
 longer pays for the chunk / slice / rope / concat / scale / cast chain; the output is bit-identical
 to the unfused sage graph. `SD_H3_FAST_SAGE_QKV=0` restores that chain.
 
+The audio VAE's anti-aliased activations run their up/down-sampling filters as direct F32
+depthwise convolutions (`CONV_2D_DW`) instead of an F16 im2col plus a matrix-vector product,
+which makes the audio decode several times faster. The input is no longer rounded to F16, so
+the waveform differs slightly from the previous graph (about 41 dB SNR on a 5 s clip).
+`SD_H3_AUDIO_DIRECT_DW=0` restores the previous graph; backends without `CONV_2D_DW` keep it.
+
 ## First/last-frame conditioning
 
 Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:
