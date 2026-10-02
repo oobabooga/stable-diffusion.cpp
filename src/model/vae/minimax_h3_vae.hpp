@@ -746,6 +746,14 @@ namespace MiniMaxH3VAE {
             params.tile_size_x     = 16;
             params.tile_size_y     = 16;
             params.target_overlap  = 0.25f;
+            // SD_H3_VAE_TILE=N: N x N latent tiles instead of 16 x 16 (opt-in; the tile seams move, so
+            // the frames are not bit-identical to the default)
+            if (const char* tile = getenv("SD_H3_VAE_TILE")) {
+                const int n = atoi(tile);
+                if (n >= 8) {
+                    params.tile_size_x = params.tile_size_y = n;
+                }
+            }
             return params;
         }
 

@@ -56,7 +56,9 @@ shapes; the arithmetic per output element is unchanged). `GGML_CUDA_FA_LONGSEQ=0
 stock kernel. `GGML_CUDA_FA_LONGSEQ_NCOLS=128` opts into a wider tile that is faster on A100 and L4
 but not bit-identical.
 
-The video VAE decodes one 16x16 latent tile per decoder graph by default.
+The video VAE decodes one 16x16 latent tile per decoder graph by default. `SD_H3_VAE_TILE=N`
+uses N x N latent tiles instead (20 decodes about 0.7 s faster at 960x544x124 on B200); the tile
+seams move, so the frames differ from the default (36 dB PSNR at 20) and it is opt-in.
 `SD_H3_VAE_TILE_BATCH=auto` puts several tiles into one graph, sized from free device memory (at
 most 4 unless `SD_H3_VAE_TILE_BATCH_MAX` raises it), and `SD_H3_VAE_TILE_BATCH=N` forces N; the
 batched projections can round differently from the per-tile decode on some GPUs, so it is
