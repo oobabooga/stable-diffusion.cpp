@@ -1633,15 +1633,17 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
             return SIZE_MAX;
         }
         size_t free_bytes = 0, total_bytes = 0;
+        // A reading is saved and reused only for checks that allocate nothing (no pending bytes,
+        // every parameter resident), so it is never one taken before this owner's buffers grew.
+        const bool reusable  = request.reuse_device_query && request.pending_allocation_bytes == 0 && missing == 0;
         const auto cache_key = std::make_pair(request.owner_id, device);
         auto cached          = device_query_cache_.find(cache_key);
-        if (request.reuse_device_query && request.pending_allocation_bytes == 0 && missing == 0 &&
-            cached != device_query_cache_.end()) {
+        if (reusable && cached != device_query_cache_.end()) {
             free_bytes  = cached->second.first;
             total_bytes = cached->second.second;
         } else {
             ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
-            if (request.reuse_device_query) {
+            if (reusable) {
                 device_query_cache_[cache_key] = {free_bytes, total_bytes};
             } else if (cached != device_query_cache_.end()) {
                 device_query_cache_.erase(cached);
@@ -1663,6 +1665,19 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
         return free_bytes;
     };
     result.available_device_bytes = available_device_bytes(request.compute_backend);
+    struct DropReadingIfNoFit {
+        const CapacityCheck& result;
+        std::map<std::pair<uintptr_t, ggml_backend_dev_t>, std::pair<size_t, size_t>>& cache;
+        uintptr_t owner;
+        ~DropReadingIfNoFit() {
+            // A failed check leads to reclaiming / evicting; the retries must see fresh readings.
+            if (!result.fits()) {
+                for (auto it = cache.begin(); it != cache.end();) {
+                    it = it->first.first == owner ? cache.erase(it) : std::next(it);
+                }
+            }
+        }
+    } drop_reading_if_no_fit{result, device_query_cache_, request.owner_id};
     if (request.max_backend_bytes > 0) {
         const size_t resident         = add(compute_backend_resident_bytes(request.compute_backend),
                                             other_runtime_resident_bytes(request.owner_id, request.compute_backend));

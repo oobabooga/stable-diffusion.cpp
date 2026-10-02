@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -994,9 +995,14 @@ namespace MiniMaxH3VAE {
                     break;
                 }
                 if (async_assembly && !tile.last) {
-                    assembler = std::thread([&run_assembly, decoded = std::move(decoded), tile]() {
-                        run_assembly(decoded, tile);
-                    });
+                    auto chunk = std::make_shared<sd::Tensor<float>>(std::move(decoded));
+                    try {
+                        assembler = std::thread([&run_assembly, chunk, tile]() {
+                            run_assembly(*chunk, tile);
+                        });
+                    } catch (const std::system_error&) {
+                        run_assembly(*chunk, tile);  // no thread available: assemble inline
+                    }
                 } else {
                     run_assembly(decoded, tile);
                 }

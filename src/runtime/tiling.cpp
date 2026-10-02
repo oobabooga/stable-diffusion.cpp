@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <memory>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -408,16 +410,25 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
         if (merge_failed) {
             return {};
         }
+        bool merged_async = false;
         if (async_merge && last < placements.size()) {
-            merger = std::thread([&merge_failed, merge_batch, data = std::move(batch.data)]() {
-                try {
-                    merge_batch(data);
-                } catch (const std::exception& error) {
-                    LOG_ERROR("tile merge failed: %s", error.what());
-                    merge_failed = true;
-                }
-            });
-        } else {
+            auto data = std::make_shared<sd::Tensor<float>>(std::move(batch.data));
+            try {
+                merger = std::thread([&merge_failed, merge_batch, data]() {
+                    try {
+                        merge_batch(*data);
+                    } catch (const std::exception& error) {
+                        LOG_ERROR("tile merge failed: %s", error.what());
+                        merge_failed = true;
+                    }
+                });
+                merged_async = true;
+            } catch (const std::system_error&) {
+                merge_batch(*data);  // no thread available: merge inline
+                merged_async = true;
+            }
+        }
+        if (!merged_async) {
             merge_batch(batch.data);
         }
 
