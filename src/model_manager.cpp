@@ -1602,6 +1602,9 @@ void ModelManager::set_workspace_reclaimer(uintptr_t owner_id, std::function<boo
 
 void ModelManager::remove_runtime_owner(uintptr_t owner_id) {
     workspace_reclaimers_.erase(owner_id);
+    for (auto it = device_query_cache_.begin(); it != device_query_cache_.end();) {
+        it = it->first.first == owner_id ? device_query_cache_.erase(it) : std::next(it);
+    }
     for (auto it = runtime_residencies_.begin(); it != runtime_residencies_.end();) {
         if (it->first.first == owner_id) {
             it = runtime_residencies_.erase(it);
@@ -1630,7 +1633,20 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
             return SIZE_MAX;
         }
         size_t free_bytes = 0, total_bytes = 0;
-        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+        const auto cache_key = std::make_pair(request.owner_id, device);
+        auto cached          = device_query_cache_.find(cache_key);
+        if (request.reuse_device_query && request.pending_allocation_bytes == 0 && missing == 0 &&
+            cached != device_query_cache_.end()) {
+            free_bytes  = cached->second.first;
+            total_bytes = cached->second.second;
+        } else {
+            ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+            if (request.reuse_device_query) {
+                device_query_cache_[cache_key] = {free_bytes, total_bytes};
+            } else if (cached != device_query_cache_.end()) {
+                device_query_cache_.erase(cached);
+            }
+        }
         if (free_bytes == 0 && total_bytes == 0) {
             return SIZE_MAX;
         }

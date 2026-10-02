@@ -1,6 +1,7 @@
 #ifndef __SD_MODEL_VAE_MINIMAX_H3_VAE_HPP__
 #define __SD_MODEL_VAE_MINIMAX_H3_VAE_HPP__
 
+#include <thread>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -605,6 +606,7 @@ namespace MiniMaxH3VAE {
         sd::Tensor<float> rope_cache;
         sd::Tensor<float> rope_a_cache;
         sd::Tensor<float> rope_b_cache;
+        std::array<int64_t, 4> rope_key_ = {0, 0, 0, 0};
 
         MiniMaxH3VideoVAERunner(ggml_backend_t backend,
                                 const String2TensorStorage& tensor_storage_map,
@@ -807,18 +809,22 @@ namespace MiniMaxH3VAE {
                 {static_cast<int>(tokens_per_chunk + token_overlap), static_cast<int>(token_overlap)});
             GGML_ASSERT(plan.tiles.size() == static_cast<size_t>(num_chunks));
             const bool keep_resident = env_int("SD_H3_VAE_KEEP_RESIDENT", 1) != 0;
+            // One device free-memory reading serves every tile that allocates nothing new
+            // (SD_H3_VAE_REUSE_MEMQUERY=0 queries the device for every capacity check).
+            set_reuse_device_query(env_int("SD_H3_VAE_REUSE_MEMQUERY", 1) != 0);
+            struct ReuseQueryGuard {
+                GGMLRunner& runner;
+                ~ReuseQueryGuard() {
+                    runner.set_reuse_device_query(false);
+                }
+            } reuse_query_guard{*this};
             tile_batch_              = 0;
             per_tile_compute_bytes_  = 0;
             std::vector<sd::Tensor<float>> pieces;
-            auto collect_pieces = [&](const sd::Tensor<float>& chunk, const VAETemporalTile& tile) {
-                auto decoded = decode_spatial_tiles(n_threads, chunk, tiling, circular_x, circular_y, silent);
-                if (!keep_resident) {
-                    runner_end();
-                }
-                if (decoded.empty()) {
-                    return sd::Tensor<float>();
-                }
-
+            // Trims the pre-padding frames of a decoded chunk and cross-fades it with the previous
+            // chunk's tail. Runs in chunk order; on a worker thread unless SD_H3_VAE_ASYNC_ASSEMBLY=0,
+            // so it overlaps the next chunk's decode (same arithmetic, bit-identical result).
+            auto assemble = [&](const sd::Tensor<float>& decoded, const VAETemporalTile& tile) {
                 int64_t first_end = std::min<int64_t>(frames_per_chunk, decoded.shape()[2]);
                 auto first        = sd::ops::slice(decoded,
                                                    2,
@@ -841,23 +847,102 @@ namespace MiniMaxH3VAE {
                 }
                 return first;
             };
+            const bool async_assembly = env_int("SD_H3_VAE_ASYNC_ASSEMBLY", 1) != 0;
+            std::thread assembler;
+            bool assembly_failed = false;
+            int64_t expected_frames = input.shape()[2] <= 1 ? 1 : ((x.shape()[2] - 2) / 5) * 17 + 5;
+            expected_frames         = std::max<int64_t>(1, expected_frames);
+            // Pieces are copied straight into the trimmed output as they are assembled (the same
+            // frames concat_frames + slice would keep), instead of concatenated at the end.
+            sd::Tensor<float> result;
+            int64_t frame_offset = 0;
+            auto append_piece    = [&](const sd::Tensor<float>& piece) {
+                GGML_ASSERT(piece.dim() == 5);
+                if (result.empty()) {
+                    std::vector<int64_t> shape = piece.shape();
+                    shape[2]                   = expected_frames;
+                    result                     = sd::Tensor<float>(std::move(shape));
+                }
+                GGML_ASSERT(piece.shape()[0] == result.shape()[0] && piece.shape()[1] == result.shape()[1] &&
+                            piece.shape()[3] == result.shape()[3] && piece.shape()[4] == result.shape()[4]);
+                const int64_t piece_frames = piece.shape()[2];
+                const int64_t keep         = std::min<int64_t>(piece_frames, expected_frames - frame_offset);
+                const int64_t plane        = piece.shape()[0] * piece.shape()[1];
+                const int64_t planes       = piece.shape()[3] * piece.shape()[4];
+                for (int64_t p = 0; keep > 0 && p < planes; ++p) {
+                    memcpy(result.data() + (p * expected_frames + frame_offset) * plane,
+                           piece.data() + p * piece_frames * plane,
+                           sizeof(float) * keep * plane);
+                }
+                frame_offset += std::max<int64_t>(keep, 0);
+            };
+            auto run_assembly = [&](const sd::Tensor<float>& decoded, const VAETemporalTile& tile) {
+                try {
+                    if (async_assembly) {
+                        append_piece(assemble(decoded, tile));
+                    } else {
+                        pieces.push_back(assemble(decoded, tile));
+                    }
+                } catch (const std::exception& error) {
+                    LOG_ERROR("MiniMax-H3 video VAE: chunk assembly failed: %s", error.what());
+                    assembly_failed = true;
+                }
+            };
+            auto join_assembler = [&]() {
+                if (assembler.joinable()) {
+                    assembler.join();
+                }
+            };
+            struct AssemblerGuard {
+                std::thread& thread;
+                ~AssemblerGuard() {
+                    if (thread.joinable()) {
+                        thread.join();
+                    }
+                }
+            } assembler_guard{assembler};
             bool failed = false;
             for (const auto& tile : plan.tiles) {
-                auto piece = collect_pieces(sd::ops::slice(input, 2, tile.start, tile.end), tile);
-                if (piece.empty()) {
+                auto decoded = decode_spatial_tiles(n_threads,
+                                                    sd::ops::slice(input, 2, tile.start, tile.end),
+                                                    tiling,
+                                                    circular_x,
+                                                    circular_y,
+                                                    silent);
+                if (!keep_resident) {
+                    runner_end();
+                }
+                join_assembler();
+                if (decoded.empty() || assembly_failed) {
                     failed = true;
                     break;
                 }
-                pieces.push_back(std::move(piece));
+                if (async_assembly && !tile.last) {
+                    assembler = std::thread([&run_assembly, decoded = std::move(decoded), tile]() {
+                        run_assembly(decoded, tile);
+                    });
+                } else {
+                    run_assembly(decoded, tile);
+                }
             }
+            join_assembler();
             runner_end();
-            if (failed || pieces.empty()) {
+            if (failed || assembly_failed) {
                 return {};
             }
-            auto result = concat_frames(pieces);
-
-            int64_t expected_frames = input.shape()[2] <= 1 ? 1 : ((x.shape()[2] - 2) / 5) * 17 + 5;
-            expected_frames         = std::max<int64_t>(1, expected_frames);
+            if (async_assembly) {
+                if (result.empty()) {
+                    return {};
+                }
+                if (frame_offset < expected_frames) {
+                    result = sd::ops::slice(result, 2, 0, frame_offset);
+                }
+                return result;
+            }
+            if (pieces.empty()) {
+                return {};
+            }
+            result = concat_frames(pieces);
             if (result.shape()[2] > expected_frames) {
                 result = sd::ops::slice(result, 2, 0, expected_frames);
             }
@@ -1063,11 +1148,17 @@ namespace MiniMaxH3VAE {
             auto input           = ensure_video_shape(z);
             const bool graph_opt = decode_graph && env_int("SD_H3_VAE_GRAPH_OPT", 1) != 0;
             if (decode_graph) {
-                rope_cache = build_rope(input.shape()[0],
-                                        input.shape()[1],
-                                        input.shape()[2]);
-                if (graph_opt) {
-                    build_rope_tables();
+                // Every spatial tile of a decode has the same extent, so the tables are rebuilt only
+                // when the tile shape (or the graph variant) changes.
+                const std::array<int64_t, 4> rope_key = {input.shape()[0], input.shape()[1], input.shape()[2], graph_opt ? 1 : 0};
+                if (rope_key != rope_key_ || rope_cache.empty()) {
+                    rope_cache = build_rope(input.shape()[0],
+                                            input.shape()[1],
+                                            input.shape()[2]);
+                    if (graph_opt) {
+                        build_rope_tables();
+                    }
+                    rope_key_ = rope_key;
                 }
             }
             auto get_graph = [&]() -> ggml_cgraph* {

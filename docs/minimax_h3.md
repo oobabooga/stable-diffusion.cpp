@@ -65,6 +65,15 @@ opt-in. The decoder weights stay on the device across temporal chunks
 table-based rotary embedding and a fused SwiGLU (`SD_H3_VAE_GRAPH_OPT=0` restores the previous
 graph). Each batched tile still goes through its own attention call.
 
+The host side of the decode overlaps the device: each tile's blend into the frame runs on a
+worker thread while the next tile computes (`SD_TILE_ASYNC_MERGE=0` blends inline; this applies
+to every tiled VAE decode), each temporal chunk is trimmed, cross-faded and copied into the final
+frames on a worker thread while the next chunk decodes (`SD_H3_VAE_ASYNC_ASSEMBLY=0` restores
+the concatenate-at-the-end path), the rotary tables are built once per tile shape, and a tile
+that allocates nothing new reuses the device free-memory reading taken earlier in the decode
+instead of querying the device for every capacity check (`SD_H3_VAE_REUSE_MEMQUERY=0`). The
+decoded frames are bit-identical either way.
+
 The DiT blocks use fused ggml ops (CPU and CUDA) for the work around the matmuls and attention:
 partial RoPE with the attention relayout and the K/V scale and F16 cast, per-segment adaLN
 modulation and gated residuals written in place, and the MLP Linear scales folded into those ops
