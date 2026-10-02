@@ -153,6 +153,13 @@ namespace MiniMaxH3 {
         return enabled;
     }
 
+    // SD_H3_FAST_SAGE_QKV=0: with --sage-attn, q/k/v go through the unfused chunk / slice / rope /
+    // concat / scale / cast chain instead of one fused RoPE + head-major op per tensor.
+    static bool fast_sage_qkv() {
+        static const bool enabled = fast_qkv() && env_flag("SD_H3_FAST_SAGE_QKV", true);
+        return enabled;
+    }
+
     static bool fast_segments() {
         static const bool enabled = graph_fast() && env_flag("SD_H3_FAST_SEGMENTS", true);
         return enabled;
@@ -293,7 +300,12 @@ namespace MiniMaxH3 {
 #ifdef SD_USE_UPSTREAM_GGML
             return nullptr;
 #else
-            if (!ctx->flash_attn_enabled || ctx->sage_attn_enabled || ctx->backend == nullptr) {
+            const bool sage = ctx->sage_attn_enabled;
+            if (ctx->backend == nullptr || (sage ? !fast_sage_qkv() : !ctx->flash_attn_enabled)) {
+                return nullptr;
+            }
+            // the sage kernel takes 64 or 128 channel heads without padding
+            if (sage && head_dim != 64 && head_dim != 128) {
                 return nullptr;
             }
             const int64_t inner = heads * head_dim;
@@ -324,12 +336,26 @@ namespace MiniMaxH3 {
             };
             auto q = q_norm->forward(ctx, part(0));
             auto k = k_norm->forward(ctx, part(1));
+            // Sage reads F32 Q/K and F16 V, all [head_dim, tokens, heads, batch]: the layout this op
+            // writes. The unfused sage path scales K and V in F32 before V's F16 cast, as here.
             q      = ggml_rope_pe_permute(ctx->ggml_ctx, q, pe, n_rot, 1.f, GGML_TYPE_F32);
-            k      = ggml_rope_pe_permute(ctx->ggml_ctx, k, pe, n_rot, kv_scale, GGML_TYPE_F16);
+            k      = ggml_rope_pe_permute(ctx->ggml_ctx, k, pe, n_rot, kv_scale, sage ? GGML_TYPE_F32 : GGML_TYPE_F16);
             auto v = ggml_rope_pe_permute(ctx->ggml_ctx, part(2), nullptr, 0, kv_scale, GGML_TYPE_F16);
             if (!ggml_backend_supports_op(ctx->backend, q) || !ggml_backend_supports_op(ctx->backend, k) ||
                 !ggml_backend_supports_op(ctx->backend, v)) {
                 return nullptr;
+            }
+            if (sage) {
+                // same softmax scale expression as ggml_ext_attention_ext's sage branch
+                const float scale = 1.0f / sqrt((float)head_dim);
+                auto out          = ggml_sage_attn(ctx->ggml_ctx, q, k, v, scale / kv_scale, GGML_SAGE_ATTN_AUTO);
+                if (!ggml_backend_supports_op(ctx->backend, out)) {
+                    return nullptr;
+                }
+                if (kv_scale != 1.0f) {
+                    out = ggml_ext_scale(ctx->ggml_ctx, out, 1.0f / kv_scale);
+                }
+                return ggml_reshape_3d(ctx->ggml_ctx, out, head_dim * heads, sequence, batch);  // [N, L, C]
             }
             q = ggml_reshape_3d(ctx->ggml_ctx, q, head_dim, sequence, heads * batch);
             k = ggml_reshape_3d(ctx->ggml_ctx, k, head_dim, sequence, heads * batch);

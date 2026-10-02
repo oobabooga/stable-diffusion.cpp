@@ -70,7 +70,10 @@ partial RoPE with the attention relayout and the K/V scale and F16 cast, per-seg
 modulation and gated residuals written in place, and the MLP Linear scales folded into those ops
 and the swiglu. The result is bit-identical to the unfused graph. `SD_H3_GRAPH_FAST=0` restores
 the unfused graph; `SD_H3_FAST_QKV=0`, `SD_H3_FAST_MLP=0`, `SD_H3_FAST_SEGMENTS=0` and
-`SD_H3_FAST_VIEWS=0` turn off one part each.
+`SD_H3_FAST_VIEWS=0` turn off one part each. With `--sage-attn` the same fused RoPE op writes the
+F32 Q/K and F16 V layout the sage kernel reads (K and V carry the kv scale), so the sage path no
+longer pays for the chunk / slice / rope / concat / scale / cast chain; the output is bit-identical
+to the unfused sage graph. `SD_H3_FAST_SAGE_QKV=0` restores that chain.
 
 ## First/last-frame conditioning
 
