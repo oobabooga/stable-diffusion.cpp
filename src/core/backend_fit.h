@@ -18,6 +18,12 @@ namespace sd::backend_fit {
     bool prepare_vae_decode_retry_tiling(sd_tiling_params_t& tiling_params,
                                          bool prefer_temporal_tiling);
 
+    // Turns on (or tightens) VAE tiling after an encode/decode failed, most likely out of memory.
+    // Returns false once there is nothing left to try.
+    bool prepare_vae_retry_tiling(sd_tiling_params_t& tiling_params,
+                                  bool prefer_temporal_tiling,
+                                  bool encode);
+
 }  // namespace sd::backend_fit
 
 #endif  // __SD_BACKEND_FIT_H__

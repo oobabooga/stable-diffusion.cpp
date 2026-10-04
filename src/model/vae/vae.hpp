@@ -205,6 +205,8 @@ public:
 
         tile_size_x = get_tile_size(params.tile_size_x, params.rel_size_x, latent_x);
         tile_size_y = get_tile_size(params.tile_size_y, params.rel_size_y, latent_y);
+        tile_size_x = sd_tiling_seam_safe_tile_size(static_cast<int>(latent_x), tile_size_x, tile_overlap);
+        tile_size_y = sd_tiling_seam_safe_tile_size(static_cast<int>(latent_y), tile_size_y, tile_overlap);
     }
 
     virtual sd::Tensor<float> encode(int n_threads,
