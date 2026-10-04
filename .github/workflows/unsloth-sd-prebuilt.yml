@@ -433,6 +433,29 @@ jobs:
           # keeps what it compiled.
           save: false
 
+      - name: cuDNN headers (build time only)
+        run: |
+          set -euo pipefail
+          # ggml-cuda's cuDNN attention path (GGML_CUDA_CUDNN) compiles against cudnn.h, but the
+          # library itself is opened with dlopen when the first attention op runs and is NOT
+          # bundled: a host without a loadable libcudnn.so.9 keeps the ggml attention kernels.
+          # Only the headers package is fetched (80 KB), pinned by version and checksum.
+          deb=libcudnn9-headers-cuda-12_9.27.0.42-1_amd64.deb
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$deb" \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/$deb"
+          echo "68243ab04422da565e0bafec00f64ac08cfd82d805c8015c0c503af7ab4dd1d6  $RUNNER_TEMP/$deb" | sha256sum -c -
+          dpkg -x "$RUNNER_TEMP/$deb" "$RUNNER_TEMP/cudnn-deb"
+          # The package ships cudnn*_v9.h; the unversioned names normally come from the -dev
+          # package's alternatives, so link them here.
+          inc="$RUNNER_TEMP/cudnn-include"
+          mkdir -p "$inc"
+          for f in "$RUNNER_TEMP"/cudnn-deb/usr/include/x86_64-linux-gnu/cudnn*_v9.h; do
+            b="$(basename "$f")"
+            ln -s "$f" "$inc/${b%_v9.h}.h"
+          done
+          test -e "$inc/cudnn.h"
+          echo "CUDNN_INCLUDE_DIR=$inc" >> "$GITHUB_ENV"
+
       - name: Build sd-cli + sd-server (CUDA)
         working-directory: src
         run: |
@@ -451,6 +474,8 @@ jobs:
             -DSD_WEBP=OFF -DSD_WEBM=OFF \
             -DGGML_NATIVE=OFF \
             -DSD_CUDA=ON \
+            -DGGML_CUDA_CUDNN=ON \
+            -DGGML_CUDA_CUDNN_INCLUDE_DIR="$CUDNN_INCLUDE_DIR" \
             -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -479,6 +504,14 @@ jobs:
             patchelf --set-rpath '$ORIGIN' "$BIN/$exe"
           done
           ldd "$BIN/sd-cli" | sed -n '1,40p'
+          # cuDNN is opened at run time only; a link-time dependency would stop the binaries
+          # loading on every host without it.
+          for exe in sd-cli sd-server; do
+            if readelf -d "$BIN/$exe" | grep -q 'NEEDED.*cudnn'; then
+              echo "ERROR: $exe links libcudnn; it must stay a run-time dlopen" >&2
+              exit 1
+            fi
+          done
 
       - name: Package bundle
         env:
