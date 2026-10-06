@@ -1,26 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright 2026-present the Unsloth AI Inc. team.
 
-name: Unsloth SD prebuilt (CPU/Apple/CUDA)
+name: Unsloth SD prebuilt (CPU/Apple/CUDA/Vulkan)
 
-# Build and publish OUR OWN stable-diffusion.cpp (sd-cli + sd-server) prebuilts for
-# the platforms where the native engine is the FASTER choice: CPU (Linux/WSL/Windows),
-# Apple (Metal), and now Linux CUDA. The last one is a correction: this pipeline was
-# built on the premise that a GPU host runs diffusers/torch instead, and MiniMax-H3
-# breaks that premise by needing more VRAM than a consumer card has, which sends those
-# hosts to the GGUF engine after all.
+# Build and publish our stable-diffusion.cpp (sd-cli + sd-server) prebuilts for
+# CPU, Apple, CUDA, and Vulkan. MiniMax-H3 uses the native engine on GPU hosts too.
+# Vulkan must carry the same H3 and graph-segment fixes as the other backends,
+# rather than sending AMD hosts to an older upstream fallback binary.
 #
-# Shape mirrors unslothai/llama.cpp's prebuilt pipeline, simplified for a 5-way
-# CPU/Apple matrix plus one best-effort CUDA leg:
+# Shape mirrors unslothai/llama.cpp's prebuilt pipeline, simplified for a 7-way
+# CPU/Apple/Vulkan matrix plus one best-effort CUDA leg:
 #   resolve      -- take THIS repository at the requested ref, merge the pinned PR set
 #                   in scripts/unsloth/pr-set.json, stamp a source tarball, name it
 #                   after the upstream release the tree descends from (supply-chain
 #                   aged), decide if our release already exists.
-#   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64 (matrix).
-#   build-windows-- Windows x64 (MSVC + Ninja).
+#   build-unix   -- macOS arm64 (Metal) + x64, Linux x64 + arm64, Linux Vulkan.
+#   build-windows-- Windows x64 CPU + Vulkan (MSVC + Ninja).
 #   build-linux-cuda -- Linux x64, CUDA 12.8, best effort (continue-on-error).
 #   assemble     -- fingerprint gate, sha256 + manifest, coverage gate, atomic
-#                   draft->publish. If any of the five CPU/Apple legs fails, assemble
+#                   draft->publish. If any CPU/Apple/Vulkan leg fails, assemble
 #                   is skipped and nothing is published (the Studio needs the full
 #                   asset set). The CUDA leg is exempt: it ships when it built and is
 #                   absent when it did not, so it can never hold back the fallbacks.
@@ -278,6 +276,12 @@ jobs:
             arch: aarch64
             defines: ""
             gate: "false"
+          - label: Linux-Ubuntu-24.04-x86_64-vulkan
+            runner: ubuntu-24.04
+            arch: x86_64
+            defines: "-DSD_VULKAN=ON"
+            gate: "false"
+            vulkan: "true"
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout mirror (tooling)
@@ -296,6 +300,12 @@ jobs:
           set -eux
           mkdir -p src
           tar -xzf "srcpkg/sd-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src
+
+      - name: Install Vulkan build dependencies
+        if: ${{ matrix.vulkan == 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev glslc spirv-headers
 
       - name: Build sd-cli + sd-server
         working-directory: src
@@ -338,8 +348,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Linux CUDA. The rest of this pipeline is CPU and Apple on the premise that GPU hosts use
-  # diffusers/torch, and that premise fails for MiniMax-H3: its Diffusers path needs about
+  # Linux CUDA. GPU hosts also need native inference for MiniMax-H3: its Diffusers path needs about
   # 68.5 GB of VRAM, so every consumer card falls back to the GGUF engine, which on Linux had
   # no accelerated build at all. Measured on one box: 65 s/step at 320x192 on 96 CPU threads,
   # against 21.5 s/step at 960x544 from a CUDA build. That is the difference between a render
@@ -348,7 +357,7 @@ jobs:
   # continue-on-error, and deliberately so. The CPU and Apple assets are what Studio falls back
   # to, and a CUDA toolchain failure must never stop them publishing. assemble collects bundles
   # by the sd-*-bin-* pattern, so this asset appears when it built and is simply absent when it
-  # did not; the coverage gate lists only the five CPU/Apple assets and must keep doing so.
+  # did not; the coverage gate requires CPU/Apple/Vulkan assets but leaves CUDA optional.
   build-linux-cuda:
     name: Linux-Ubuntu-22.04-x86_64-cuda12
     needs: resolve
@@ -516,10 +525,20 @@ jobs:
           key: ccache-sd-cuda-${{ env.CUDA_VERSION }}-${{ steps.cckey.outputs.archs }}-${{ needs.resolve.outputs.tag }}-
 
   build-windows:
-    name: win-cpu-x64
+    name: ${{ matrix.label }}
     needs: resolve
     if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: win-cpu-x64
+            vulkan: "OFF"
+          - label: win-vulkan-x64
+            vulkan: "ON"
+    env:
+      VULKAN_VERSION: 1.4.328.1
     # Gate on the environment, matching unslothai/unsloth's release-desktop.yml:
     # the job that can read the signing credentials is named explicitly.
     environment: release-signing
@@ -551,6 +570,21 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
 
+      - name: Install Vulkan SDK
+        if: ${{ matrix.vulkan == 'ON' }}
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'
+          $sdkRoot = Join-Path $env:RUNNER_TEMP 'VulkanSDK'
+          curl.exe --fail --location --retry 3 --output $installer "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $install = Start-Process -FilePath $installer -ArgumentList @(
+            '--root', "`"$sdkRoot`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0) { exit $install.ExitCode }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkRoot"
+          Add-Content $env:GITHUB_PATH "$sdkRoot\Bin"
+
       - name: Build sd-cli + sd-server
         shell: pwsh
         working-directory: src
@@ -561,6 +595,7 @@ jobs:
             -DSD_BUILD_EXAMPLES=ON `
             -DSD_SERVER_BUILD_FRONTEND=OFF `
             -DSD_WEBP=OFF -DSD_WEBM=OFF `
+            -DSD_VULKAN=${{ matrix.vulkan }} `
             -DGGML_NATIVE=OFF
           cmake --build build --config Release -j 3 --target sd-cli sd-server
 
@@ -585,7 +620,7 @@ jobs:
           BIN_DIR: ${{ github.workspace }}/src/build/bin
           OUT_DIR: ${{ github.workspace }}/dist
           TAG: ${{ needs.resolve.outputs.tag }}
-          LABEL: win-cpu-x64
+          LABEL: ${{ matrix.label }}
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
           LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
@@ -610,8 +645,8 @@ jobs:
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: sd-${{ needs.resolve.outputs.tag }}-bin-win-cpu-x64
-          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-win-cpu-x64.zip
+          name: sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}
+          path: dist/sd-${{ needs.resolve.outputs.tag }}-bin-${{ matrix.label }}.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -671,7 +706,7 @@ jobs:
             --publish-repo "$GITHUB_REPOSITORY"
           ls -la dist
 
-      - name: Coverage gate (all 5 CPU/Apple assets present)
+      - name: Coverage gate (all 7 CPU/Apple/Vulkan assets present)
         run: |
           set -eu
           TAG='${{ needs.resolve.outputs.tag }}'
@@ -681,7 +716,9 @@ jobs:
             "sd-${TAG}-bin-Darwin-macOS-x86_64.zip" \
             "sd-${TAG}-bin-Linux-Ubuntu-22.04-x86_64.zip" \
             "sd-${TAG}-bin-Linux-Ubuntu-24.04-aarch64.zip" \
-            "sd-${TAG}-bin-win-cpu-x64.zip"; do
+            "sd-${TAG}-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip" \
+            "sd-${TAG}-bin-win-cpu-x64.zip" \
+            "sd-${TAG}-bin-win-vulkan-x64.zip"; do
             [ -s "dist/$f" ] || { echo "ERROR: missing $f" >&2; fail=1; }
           done
           [ "$fail" = 0 ] || { echo "ERROR: refusing to publish a partial release" >&2; exit 1; }
@@ -718,7 +755,7 @@ jobs:
           AHEAD='${{ needs.resolve.outputs.ahead }}'
           COMMIT='${{ needs.resolve.outputs.commit }}'
           REPO="$GITHUB_REPOSITORY"
-          NOTES="Automated Unsloth stable-diffusion.cpp CPU + Apple prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. GPU hosts use diffusers/torch; this native engine targets CPU (Linux/WSL/Windows) and Apple (Metal)."
+          NOTES="Automated Unsloth stable-diffusion.cpp prebuild (sd-cli + sd-server), built from [\`${COMMIT}\`](https://github.com/${REPO}/commit/${COMMIT}) in this repository. Includes CPU, Apple Metal, and Linux/Windows Vulkan builds, plus Linux CUDA when its build succeeds."
           PINS='${{ needs.resolve.outputs.pins }}'
           if [ "${AHEAD:-0}" -gt 0 ]; then
             NOTES="${NOTES}"$'\n\n'"Not a stock build: the tree is ${AHEAD} commits past the ${UPSTREAM_TAG} release it descends from, which is what the \`-u\` suffix on the tag marks. \`sd-prebuilt-manifest.json\` records the commit."
