@@ -359,7 +359,7 @@ jobs:
     # the objects, and these two do.
     env:
       CUDA_VERSION: "12.8.1"
-      CUDA_ARCHS: "75;80;86;89;90;100;120"
+      CUDA_ARCHS: "70;75;80;86;89;90;100;120"
     steps:
       - name: Checkout mirror (tooling)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -431,9 +431,9 @@ jobs:
         working-directory: src
         run: |
           set -euo pipefail
-          # Turing through Blackwell. 12.8 is the first toolkit that can emit sm_100 (B200) and
-          # sm_120 (RTX 50), and anything older than Turing is not a realistic host for a 20 GB
-          # video denoiser. build.yml's Windows leg uses the same list plus 61 and 70.
+          # Volta through Blackwell. V100 can run H3 with quantized weights and CPU offload,
+          # but a device probe succeeds even when the binary has no sm_70 kernels. Include
+          # sm_70 so generation does not fail at the first CUDA kernel launch.
           #
           # The CUDA launcher matters more than the other two here: Jimver installs nvcc outside
           # the default search, and nvcc is nearly the whole build, so caching only C/CXX would
