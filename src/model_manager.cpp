@@ -1633,8 +1633,7 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
             return SIZE_MAX;
         }
         size_t free_bytes = 0, total_bytes = 0;
-        // A reading is saved and reused only for checks that allocate nothing (no pending bytes,
-        // every parameter resident), so it is never one taken before this owner's buffers grew.
+        // only checks that allocate nothing reuse a reading, so it never predates this owner's growth
         const bool reusable  = request.reuse_device_query && request.pending_allocation_bytes == 0 && missing == 0;
         const auto cache_key = std::make_pair(request.owner_id, device);
         auto cached          = device_query_cache_.find(cache_key);
