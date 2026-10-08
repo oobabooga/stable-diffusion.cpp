@@ -1,0 +1,43 @@
+name: AMD DevLab CI (sd.cpp #21 VAE retry)
+
+on:
+  push:
+    branches: [amd-devlab-ci-sd21]
+
+permissions: {}
+
+jobs:
+  linux-vulkan:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 120
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | grep -E "Model name"; free -h; df -h "$RUNNER_TEMP" | tail -1
+          lspci -nn | grep -iE 'vga|display' || true
+      - name: VAE OOM retry, master vs PR
+        run: |
+          git clone -q --depth 1 --branch amd-devlab-ci-sd21 https://github.com/oobabooga/stable-diffusion.cpp "$RUNNER_TEMP/wf"
+          bash "$RUNNER_TEMP/wf/tools/vae_oom.sh" linux
+
+  windows-vulkan:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 150
+    steps:
+      - name: Vulkan SDK
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vk = "$env:RUNNER_TEMP\VulkanSDK"
+          Invoke-WebRequest -Uri https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe -OutFile "$env:RUNNER_TEMP\vk.exe"
+          Start-Process -Wait -FilePath "$env:RUNNER_TEMP\vk.exe" -ArgumentList "--root","$vk","--accept-licenses","--default-answer","--confirm-command","install"
+          Get-ChildItem "$vk\Bin" | Select-Object -First 3
+          git config --global core.autocrlf false
+          git clone -q --depth 1 --branch amd-devlab-ci-sd21 https://github.com/oobabooga/stable-diffusion.cpp "$env:RUNNER_TEMP\wf"
+      - name: VAE OOM retry, master vs PR
+        shell: powershell
+        run: |
+          $env:VULKAN_SDK = "$env:RUNNER_TEMP\VulkanSDK"
+          $env:PATH = "$env:VULKAN_SDK\Bin;$env:PATH"
+          & "C:\Program Files\Git\bin\bash.exe" "$env:RUNNER_TEMP\wf\tools\vae_oom.sh" windows
+          exit 0
