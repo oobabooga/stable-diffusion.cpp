@@ -2,7 +2,7 @@ name: SD14 ROCm leg test (throwaway)
 on:
   push:
     branches:
-    - sd14-rocm-ci
+    - sd14-rocm-ci-u
 permissions:
   contents: read
 env:
