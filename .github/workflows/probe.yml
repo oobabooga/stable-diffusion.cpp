@@ -1,0 +1,30 @@
+name: SD14 AMD baseline probe (throwaway)
+on:
+  push:
+    branches:
+    - sd14-amd-probe
+permissions: {}
+jobs:
+  amd:
+    name: AMD gfx1151 A/B
+    runs-on:
+    - self-hosted
+    - Linux
+    - strix-halo
+    - devlab-dispatch
+    timeout-minutes: 180
+    permissions: {}
+    steps:
+    - name: Fetch test scripts
+      run: |
+        set -eux
+        git clone -q --depth 1 --branch sd14-rocm-ci https://github.com/oobabooga/stable-diffusion.cpp "$RUNNER_TEMP/ci-src"
+    - name: A/B
+      run: bash "$RUNNER_TEMP/ci-src/ci/amd_test.sh" 2>&1
+    - name: Upload outputs
+      if: ${{ always() }}
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: amd-baseline-out
+        path: ${{ runner.temp }}/unsloth-work/out
+        retention-days: 3
