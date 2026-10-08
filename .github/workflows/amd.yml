@@ -1,0 +1,76 @@
+name: AMD DevLab CI (sd.cpp #19)
+
+on:
+  push:
+    branches: [amd-devlab-ci-sd19]
+
+permissions: {}
+
+jobs:
+  linux-ops:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [vulkan, hip]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; lscpu | grep -E "Model name|^CPU\(s\)"; free -h
+          lspci -nn | grep -iE 'vga|display' || true
+          ls /usr/share/vulkan/icd.d 2>/dev/null || true; sudo -n true 2>/dev/null && echo "sudo ok" || echo "no sudo"
+      - name: test-backend-ops
+        run: |
+          git clone -q --depth 1 --branch amd-devlab-ci-sd19 https://github.com/oobabooga/stable-diffusion.cpp "$RUNNER_TEMP/wf"
+          bash "$RUNNER_TEMP/wf/tools/ops.sh" ${{ matrix.backend }}
+
+  linux-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [vulkan, hip]
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 180
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; free -h; df -h "$RUNNER_TEMP" | tail -1
+          cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null || true
+      - name: Render base vs PR
+        run: |
+          git clone -q --depth 1 --branch amd-devlab-ci-sd19 https://github.com/oobabooga/stable-diffusion.cpp "$RUNNER_TEMP/wf"
+          bash "$RUNNER_TEMP/wf/tools/e2e.sh" ${{ matrix.backend }}
+
+  windows-ops:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 90
+    steps:
+      - name: Vulkan SDK
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vk = "$env:RUNNER_TEMP\VulkanSDK"
+          Invoke-WebRequest -Uri https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe -OutFile "$env:RUNNER_TEMP\vk.exe"
+          Start-Process -Wait -FilePath "$env:RUNNER_TEMP\vk.exe" -ArgumentList "--root","$vk","--accept-licenses","--default-answer","--confirm-command","install"
+          Get-ChildItem "$vk\Bin" | Select-Object -First 5
+          git config --global core.autocrlf false
+          git clone -q --depth 1 --branch amd-devlab-ci-sd19 https://github.com/oobabooga/stable-diffusion.cpp "$env:RUNNER_TEMP\wf"
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp "$env:RUNNER_TEMP\src"
+          cd "$env:RUNNER_TEMP\src"
+          git fetch -q origin perf/h3-gguf-speed-v3; git checkout -q 338079e; git submodule update --init --depth 1 ggml
+          Get-ChildItem scripts\unsloth\ggml-patches\*.patch | ForEach-Object { git -C ggml apply "..\scripts\unsloth\ggml-patches\$($_.Name)"; if ($LASTEXITCODE) { throw "patch $($_.Name)" } }
+          python "$env:RUNNER_TEMP\wf\tools\h3_dw_tests.py" ggml\tests\test-backend-ops.cpp
+          python -m pip install -q ninja
+      - name: Build and test
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          set VULKAN_SDK=%RUNNER_TEMP%\VulkanSDK
+          set PATH=%VULKAN_SDK%\Bin;%PATH%
+          cd /d %RUNNER_TEMP%\src
+          cmake -S ggml -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_BUILD_TESTS=ON -DGGML_NATIVE=OFF || exit /b 1
+          cmake --build build -j 32 --target test-backend-ops || exit /b 1
+          build\bin\test-backend-ops.exe -b Vulkan0 -o CONV_2D_DW
+          build\bin\test-backend-ops.exe -b Vulkan0 -o ROPE_PE_PERMUTE
+          exit /b 0
