@@ -1,0 +1,98 @@
+name: SD20 Linux CUDA leg check (throwaway)
+
+on:
+  push:
+    branches: [sd20-cuda-leg-check]
+
+permissions: {}
+
+env:
+  PR_SHA: aff34f1542edb66acf2f5bb5daae1c895db0afe4
+  CUDA_VERSION: "12.8.1"
+  CUDA_ARCHS: "89"
+
+jobs:
+  cuda-leg:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [as-in-pr, plus-nvrtc-dev]
+    steps:
+      - name: Source as the resolve job prepares it
+        run: |
+          set -euxo pipefail
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp src
+          cd src
+          git fetch -q origin "$PR_SHA"
+          git checkout -q "$PR_SHA"
+          git submodule update --init --recursive --depth 1 ggml
+          for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply --verbose "../$p"; done
+      - name: Free disk for the toolkit
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/share/boost
+      - name: Install CUDA toolkit (as in PR)
+        if: matrix.variant == 'as-in-pr'
+        id: tk1
+        uses: Jimver/cuda-toolkit@95b5a29a2823ef87666dcd45ec236fc4f82498d0  # v0.2.22
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "thrust"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+      - name: Install CUDA toolkit (plus nvrtc-dev)
+        if: matrix.variant == 'plus-nvrtc-dev'
+        id: tk2
+        uses: Jimver/cuda-toolkit@95b5a29a2823ef87666dcd45ec236fc4f82498d0  # v0.2.22
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: "network"
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "thrust", "nvrtc-dev"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+      - name: Toolkit headers present
+        run: |
+          R="${{ steps.tk1.outputs.CUDA_PATH }}${{ steps.tk2.outputs.CUDA_PATH }}"
+          echo "CUDA_PATH=$R"
+          for h in cuda.h nvrtc.h cuda_runtime.h cublas_v2.h; do printf '%s: ' $h; ls "$R/include/$h" 2>/dev/null || echo MISSING; done
+          dpkg -l | grep -E "cuda-(nvrtc|driver)" || true
+      - name: cuDNN headers (build time only, verbatim from PR)
+        run: |
+          set -euo pipefail
+          deb=libcudnn9-headers-cuda-12_9.27.0.42-1_amd64.deb
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$deb" \
+            "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/$deb"
+          echo "68243ab04422da565e0bafec00f64ac08cfd82d805c8015c0c503af7ab4dd1d6  $RUNNER_TEMP/$deb" | sha256sum -c -
+          dpkg -x "$RUNNER_TEMP/$deb" "$RUNNER_TEMP/cudnn-deb"
+          inc="$RUNNER_TEMP/cudnn-include"
+          mkdir -p "$inc"
+          for f in "$RUNNER_TEMP"/cudnn-deb/usr/include/x86_64-linux-gnu/cudnn*_v9.h; do
+            b="$(basename "$f")"
+            ln -s "$f" "$inc/${b%_v9.h}.h"
+          done
+          test -e "$inc/cudnn.h"
+          echo "CUDNN_INCLUDE_DIR=$inc" >> "$GITHUB_ENV"
+      - name: Configure (PR flags, one arch, no ccache)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF \
+            -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF -DSD_CUDA=ON -DGGML_CUDA_CUDNN=ON \
+            -DGGML_CUDA_CUDNN_INCLUDE_DIR="$CUDNN_INCLUDE_DIR" -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" 2>&1 | tee cmake.log | grep -i -E "cudnn|cuda toolkit|error" || true
+      - name: Compile the cuDNN graph object first
+        working-directory: src
+        run: |
+          set -o pipefail
+          make -C build ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/build.make >/dev/null 2>&1 || true
+          cd build/ggml/src/ggml-cuda && make -f CMakeFiles/ggml-cuda.dir/build.make CMakeFiles/ggml-cuda.dir/cudnn-attn-graph.cpp.o 2>&1 | tail -30
+      - name: Build sd-cli + sd-server
+        working-directory: src
+        run: cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server 2>&1 | grep -E "error|Error|Built target sd-" | head -40; test -x build/bin/sd-cli
+      - name: NEEDED check and LICENSE concat (verbatim logic)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          for exe in sd-cli sd-server; do
+            readelf -d build/bin/$exe | grep NEEDED
+            if readelf -d "build/bin/$exe" | grep -q 'NEEDED.*cudnn'; then echo "ERROR: $exe links libcudnn" >&2; exit 1; fi
+          done
+          { cat LICENSE; printf '\n\n---- cudnn-frontend ----\n\n'; cat build/_deps/ggml_cudnn_frontend-src/LICENSE.txt; } > "$RUNNER_TEMP/LICENSE"
+          wc -l "$RUNNER_TEMP/LICENSE"; strings build/bin/sd-cli | grep -c -i "cudnn" || true
