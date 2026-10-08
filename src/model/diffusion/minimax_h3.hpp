@@ -214,7 +214,7 @@ namespace MiniMaxH3 {
             const float s2 = fc2->effective_scale(ctx);
             auto h        = ggml_ext_linear_matmul(ctx->ggml_ctx, x, fc1->foldable_weight(ctx), fc1->prec_f32());
             auto halves   = ggml_ext_chunk(ctx->ggml_ctx, h, 2, 0, false);
-#ifdef SD_USE_UPSTREAM_GGML
+#ifndef SD_GGML_H3_FUSED_OPS
             GGML_UNUSED(s1);
             GGML_UNUSED(s2);
             GGML_UNUSED(halves);
@@ -290,7 +290,7 @@ namespace MiniMaxH3 {
                                         int64_t sequence,
                                         int64_t batch,
                                         ggml_tensor* pe) {
-#ifdef SD_USE_UPSTREAM_GGML
+#ifndef SD_GGML_H3_FUSED_OPS
             return nullptr;
 #else
             if (!ctx->flash_attn_enabled || ctx->sage_attn_enabled || ctx->backend == nullptr) {
@@ -561,7 +561,7 @@ namespace MiniMaxH3 {
                                    ggml_tensor* t_emb,
                                    const std::vector<TokenModulationSpan>& segments,
                                    ggml_tensor* pe) {
-#ifdef SD_USE_UPSTREAM_GGML
+#ifndef SD_GGML_H3_FUSED_OPS
             return nullptr;
 #else
             if (ctx->backend == nullptr || segments.empty() || x->type != GGML_TYPE_F32) {
