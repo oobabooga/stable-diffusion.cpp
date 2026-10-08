@@ -544,8 +544,16 @@ jobs:
           LABEL: Linux-Ubuntu-22.04-x86_64-cuda12
           COMMIT: ${{ needs.resolve.outputs.commit }}
           SOURCE_REPO: ${{ github.repository }}
-          LICENSE_FILE: ${{ github.workspace }}/src/LICENSE
-        run: python3 tooling/scripts/unsloth/package_bundle.py
+          LICENSE_FILE: ${{ runner.temp }}/LICENSE
+        run: |
+          set -euo pipefail
+          # The binaries compile in cudnn-frontend's header-only templates, so its MIT notice ships too.
+          {
+            cat src/LICENSE
+            printf '\n\n---- cudnn-frontend (https://github.com/NVIDIA/cudnn-frontend) ----\n\n'
+            cat src/build/_deps/ggml_cudnn_frontend-src/LICENSE.txt
+          } > "$LICENSE_FILE"
+          python3 tooling/scripts/unsloth/package_bundle.py
 
       - name: Upload bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
