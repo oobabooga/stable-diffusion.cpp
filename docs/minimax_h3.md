@@ -72,6 +72,12 @@ and the swiglu. The result is bit-identical to the unfused graph. `SD_H3_GRAPH_F
 the unfused graph; `SD_H3_FAST_QKV=0`, `SD_H3_FAST_MLP=0`, `SD_H3_FAST_SEGMENTS=0` and
 `SD_H3_FAST_VIEWS=0` turn off one part each.
 
+The long-sequence flash attention kernel, the fused cuBLAS epilogues and the fused DiT ops come from
+the ggml patches in `scripts/unsloth/ggml-patches`, which the Unsloth prebuilt binaries carry. A
+source build gets them by applying the patches to the `ggml` submodule before configuring
+(`for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply "../$p"; done`); without
+them the build uses the stock ggml kernels and the unfused DiT graph.
+
 ## First/last-frame conditioning
 
 Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:
