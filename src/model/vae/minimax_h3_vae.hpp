@@ -300,7 +300,7 @@ namespace MiniMaxH3VAE {
                                         ggml_tensor* pe,
                                         ggml_tensor* rope_a,
                                         ggml_tensor* rope_b) {
-#ifdef SD_USE_UPSTREAM_GGML
+#ifndef SD_GGML_H3_FUSED_OPS
             return nullptr;
 #else
             static const bool enabled = [] {
@@ -324,14 +324,15 @@ namespace MiniMaxH3VAE {
                 return ggml_view_4d(ctx->ggml_ctx, qkv, head_dim, num_head, sequence, 1,
                                     qkv->nb[1], qkv->nb[2], qkv->nb[3], index * head_dim * sizeof(float));
             };
+            ggml_tensor* q = nullptr;
+            ggml_tensor* k = nullptr;
+#ifdef SD_GGML_H3_FUSED_QK_NORM
             // q/k RMS norm folded into the RoPE op where the backend reproduces GGML_OP_RMS_NORM's
             // arithmetic in it (SD_H3_VAE_FUSED_QK_NORM=0 keeps the separate norm).
             static const bool fuse_norm = [] {
                 const char* v = getenv("SD_H3_VAE_FUSED_QK_NORM");
                 return v == nullptr || v[0] == '\0' || atoi(v) != 0;
             }();
-            ggml_tensor* q = nullptr;
-            ggml_tensor* k = nullptr;
             if (fuse_norm) {
                 q = ggml_rope_pe_permute_rms(ctx->ggml_ctx, part(0), pe, n_rot, 1.f, GGML_TYPE_F32, 1e-5f);
                 k = ggml_rope_pe_permute_rms(ctx->ggml_ctx, part(1), pe, n_rot, kv_scale, GGML_TYPE_F16, 1e-5f);
@@ -339,6 +340,7 @@ namespace MiniMaxH3VAE {
                     q = k = nullptr;
                 }
             }
+#endif
             if (q == nullptr) {
                 q = ggml_rope_pe_permute(ctx->ggml_ctx, ggml_rms_norm(ctx->ggml_ctx, part(0), 1e-5f), pe, n_rot, 1.f, GGML_TYPE_F32);
                 k = ggml_rope_pe_permute(ctx->ggml_ctx, ggml_rms_norm(ctx->ggml_ctx, part(1), 1e-5f), pe, n_rot, kv_scale, GGML_TYPE_F16);
