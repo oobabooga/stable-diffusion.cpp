@@ -49,7 +49,7 @@ jobs:
           git clone -q https://github.com/unslothai/stable-diffusion.cpp src
           git -C src fetch -q origin "$PR_SHA" "$BASE_SHA" || git -C src fetch -q origin perf/h3-gguf-speed perf/h3-gguf-speed-v2
           git clone -q https://github.com/leejet/ggml ggml-clone
-          git -C ggml-clone checkout -q "$GGML_SHA"
+          git -C ggml-clone fetch -q origin "$GGML_SHA"; git -C ggml-clone checkout -q "$GGML_SHA"
           for n in base pr; do
             sha=$([ $n = base ] && echo $BASE_SHA || echo $PR_SHA)
             git -C src worktree add -q --detach "$W/$n" "$sha"
@@ -141,7 +141,7 @@ jobs:
           git fetch -q origin %PR_SHA% || exit /b 1
           git checkout -q %PR_SHA% || exit /b 1
           git submodule update --init ggml || exit /b 1
-          git -C ggml checkout -q %GGML_SHA% || exit /b 1
+          git -C ggml fetch -q origin %GGML_SHA% && git -C ggml checkout -q %GGML_SHA% || exit /b 1
           for %%P in (scripts\unsloth\ggml-patches\*.patch) do (
             git -C ggml apply ..\scripts\unsloth\ggml-patches\%%~nxP || (echo PATCH FAILED %%P & exit /b 1)
           )
