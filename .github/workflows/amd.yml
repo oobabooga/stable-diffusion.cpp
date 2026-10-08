@@ -1,0 +1,102 @@
+name: SD20 AMD inert check (throwaway)
+
+on:
+  push:
+    branches: [sd20-amd-check]
+
+permissions: {}
+
+env:
+  BASE_SHA: 338079e
+  PR_SHA: aff34f1542edb66acf2f5bb5daae1c895db0afe4
+  GGML_SHA: f583f393cd5dfdc129360bbf75cb3d49ccc837a8
+  ROCM_VERSION: 7.14.0
+
+jobs:
+  hip:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    steps:
+      - name: Hardware
+        run: |
+          uname -a; nproc; free -h; df -h "$RUNNER_TEMP"
+          ls -l /dev/kfd /dev/dri 2>&1 || true
+      - name: Setup ROCm and tools
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"/{tmp,hf,cache}
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"
+          python -m pip install -q --upgrade pip
+          python -m pip install -q cmake ninja huggingface_hub hf_transfer numpy pillow
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel,device-gfx1151]==${ROCM_VERSION}"
+          R="$(rocm-sdk path --root)"
+          { echo "W=$W"; echo "ROCM_PATH=$R"; echo "HIP_PATH=$R"; echo "CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)"; echo "LD_LIBRARY_PATH=$R/lib"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "HF_HUB_ENABLE_HF_TRANSFER=1"; } >> "$GITHUB_ENV"
+          { echo "$(rocm-sdk path --bin)"; echo "$W/venv/bin"; } >> "$GITHUB_PATH"
+      - name: Start model download
+        run: |
+          cd "$W"
+          nohup python -c "
+          from huggingface_hub import hf_hub_download as d
+          r='unsloth/MiniMax-H3-GGUF'
+          for f in ['vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors','minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf','qwen3vl_32b_minimax_h3-Q2_K_M.gguf']:
+              print(d(r, f, local_dir='$W/models'), flush=True)
+          print('DONE', flush=True)
+          " > "$W/dl.log" 2>&1 &
+      - name: Checkout and patch
+        run: |
+          set -euo pipefail
+          cd "$W"
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp src
+          git -C src fetch -q origin "$PR_SHA" perf/h3-gguf-speed-v3
+          git clone -q https://github.com/leejet/ggml ggml-clone
+          git -C ggml-clone checkout -q "$GGML_SHA"
+          for n in base pr; do
+            sha=$([ $n = base ] && echo $BASE_SHA || echo $PR_SHA)
+            git -C src worktree add -q --detach "$W/$n" "$sha"
+            rm -rf "$W/$n/ggml"; cp -r ggml-clone "$W/$n/ggml"
+            for p in "$W/$n"/scripts/unsloth/ggml-patches/*.patch; do git -C "$W/$n/ggml" apply "$p"; done
+            echo "$n $(git -C $W/$n log --oneline -1) patches=$(ls $W/$n/scripts/unsloth/ggml-patches | wc -l)"
+          done
+      - name: Build (HIP gfx1151; PR with GGML_CUDA_CUDNN=ON passed)
+        run: |
+          set -euo pipefail
+          for n in base pr; do
+            cd "$W/$n"
+            extra=""; [ $n = pr ] && extra="-DGGML_CUDA_CUDNN=ON"
+            cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+              -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF \
+              -DSD_HIPBLAS=ON -DHIP_PLATFORM=amd -DGPU_TARGETS=gfx1151 -DGGML_BUILD_TESTS=ON $extra > "$W/cmake-$n.log" 2>&1 || { tail -50 "$W/cmake-$n.log"; exit 1; }
+            grep -i "cudnn" "$W/cmake-$n.log" || echo "$n: no cudnn lines in cmake output"
+            cmake --build build -j 32 --target sd-cli test-backend-ops > "$W/build-$n.log" 2>&1 || { grep -i -E "error" "$W/build-$n.log" | head -40; tail -30 "$W/build-$n.log"; exit 1; }
+            grep -c -i "cudnn-attn" "$W/build-$n.log" || true
+            strings build/bin/sd-cli | grep -c GGML_CUDA_CUDNN || true
+          done
+      - name: test-backend-ops FLASH_ATTN_EXT (ROCm0)
+        run: |
+          set +e
+          for n in base pr; do
+            "$W/$n/build/bin/test-backend-ops" test -b ROCm0 -o FLASH_ATTN_EXT > "$W/tbo-$n.log" 2>&1
+            echo "$n: $(grep -E "tests passed" "$W/tbo-$n.log" | tail -1) FAIL=$(grep -c "FAIL" "$W/tbo-$n.log")"
+            grep -E "\[FAIL\]" "$W/tbo-$n.log" | head -5
+          done
+          exit 0
+      - name: Render base vs PR (expect bit-identical)
+        run: |
+          set -uo pipefail
+          for i in $(seq 1 120); do grep -q DONE "$W/dl.log" && break; sleep 30; done
+          grep -q DONE "$W/dl.log" || { cat "$W/dl.log"; exit 1; }
+          M="$W/models"
+          render() {
+            local name=$1 bin=$2
+            mkdir -p "$W/out/$name"
+            /usr/bin/time -f "%e s wall" "$bin" -M vid_gen --diffusion-model "$M/minimax_h3_fl2va_pruned-UD-Q3_K_XL.gguf" \
+              --vae "$M/vae/minimax_h3_video_vae_fp16.safetensors" --audio-vae "$M/vae/minimax_h3_audio_vae_fp32.safetensors" \
+              --llm "$M/qwen3vl_32b_minimax_h3-Q2_K_M.gguf" -p "A red fox runs through fresh snow in a pine forest, soft morning light, wind and crunching snow sounds." \
+              --cfg-scale 1.0 -W 480 -H 272 --video-frames 25 --steps 2 --seed 42 --rng cpu --diffusion-fa --fps 24 -v \
+              -o "$W/out/$name/f_%03d.png" > "$W/out/$name.log" 2>&1
+            echo "$name exit=$? $(tail -1 $W/out/$name.log) frames=$(ls $W/out/$name | wc -l) hash=$(cd $W/out/$name && sha256sum $(ls) | sha256sum | cut -c1-16)"
+            grep -i "cudnn" "$W/out/$name.log" | head -3
+          }
+          render base "$W/base/build/bin/sd-cli"
+          render pr "$W/pr/build/bin/sd-cli"
+          diff -rq "$W/out/base" "$W/out/pr" && echo "BIT-IDENTICAL"
