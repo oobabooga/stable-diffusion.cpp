@@ -333,10 +333,7 @@ sd::Tensor<float> process_tiles_2d_batched(const sd::Tensor<float>& input,
         LOG_VERBOSE("processing %i tiles", num_tiles);
         pretty_progress(0, num_tiles, 0.0f);
     }
-    // The host-side blend of a batch runs on a worker thread while the next batch is split and
-    // computed, so the device does not idle through it. Merges still run one at a time in tile
-    // order with the same arithmetic, so the result is bit-identical. SD_TILE_ASYNC_MERGE=0 merges
-    // inline.
+    // Blend on a worker while the next batch computes, still in tile order; SD_TILE_ASYNC_MERGE=0 blends inline.
     static const bool async_merge = []() {
         const char* value = getenv("SD_TILE_ASYNC_MERGE");
         return value == nullptr || value[0] == '\0' || atoi(value) != 0;

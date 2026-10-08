@@ -27,9 +27,7 @@ struct DeviceMemoryRequest {
     size_t pending_allocation_bytes = 0;
     size_t runtime_resident_bytes   = 0;
     size_t max_backend_bytes        = 0;
-    // The caller repeats an identical compute (e.g. one tile after another). When nothing new is
-    // allocated (no pending bytes, every parameter already resident), the manager may answer from
-    // the device free-memory figure it read for this owner earlier instead of querying again.
+    // Repeated identical compute: a check that allocates nothing may reuse this owner's last free-memory reading.
     bool reuse_device_query = false;
 
     // Runtime buffers only; the manager accounts for weights separately.

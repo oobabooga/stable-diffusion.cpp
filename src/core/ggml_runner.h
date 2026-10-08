@@ -370,8 +370,7 @@ public:
         weight_adapter = adapter;
     }
 
-    // See DeviceMemoryRequest::reuse_device_query. Callers turn it on around a run of identical
-    // computes (spatial tiles) and off afterwards; runner_end() drops the saved reading.
+    // See DeviceMemoryRequest::reuse_device_query; runner_end() drops the saved reading.
     void set_reuse_device_query(bool enabled) {
         reuse_device_query_ = enabled;
     }

@@ -396,9 +396,7 @@ namespace LTXV {
         return ggml_reshape_4d(ctx, out, out_time, channels, 1, 1);
     }
 
-    // Direct depthwise conv (one F32 kernel per channel, no im2col, no F16 rounding of the input) for
-    // the anti-aliased activations. x: [time, channels, 1, 1]. Returns nullptr when the backend lacks
-    // CONV_2D_DW so callers fall back to the im2col graph.
+    // F32 depthwise conv without im2col or F16 input rounding; nullptr when the backend lacks CONV_2D_DW.
     static ggml_tensor* depthwise_conv1d_direct(GGMLRunnerContext* runner_ctx,
                                                 ggml_tensor* x,
                                                 ggml_tensor* filter,
@@ -427,8 +425,7 @@ namespace LTXV {
         return ggml_reshape_4d(ctx, out, out->ne[0], channels, 1, 1);
     }
 
-    // depthwise_conv_transpose1d through the direct depthwise conv: same zero-stuffing, reversed
-    // filter and full padding, then the same stride gain.
+    // depthwise_conv_transpose1d via the direct conv: same zero-stuffing, reversed filter, padding and gain.
     static ggml_tensor* depthwise_conv_transpose1d_direct(GGMLRunnerContext* runner_ctx,
                                                           ggml_tensor* x,
                                                           ggml_tensor* filter,
@@ -735,7 +732,6 @@ namespace LTXV {
         int up_kernel_size   = 12;
         int down_kernel_size = 12;
 
-        // direct depthwise convs instead of the im2col graph; opt-in per model (MiniMax-H3 sets it)
         bool direct_dw = false;
 
         explicit Activation1D(int64_t channels, bool direct_dw = false)

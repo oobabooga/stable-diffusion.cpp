@@ -290,17 +290,14 @@ namespace MiniMaxH3VAE {
             blocks["to_out"] = std::make_shared<Linear>(dim, dim, true);
         }
 
-        // Single-tile flash-attention decode: q/k RMS-normed in place on the projection, then one
-        // ggml_rope_pe_permute per tensor applies the partial RoPE, writes the head-major layout the
-        // attention kernel reads and casts K/V to F16. Same products, sums and casts as the table
-        // RoPE + chunk / permute / cast chain, so the result is bit-identical. Returns nullptr when
-        // it does not apply (SD_H3_VAE_FUSED_QKV=0 turns it off).
+        // Single-tile flash-attention decode: one ggml_rope_pe_permute per tensor replaces the table RoPE +
+        // chunk / permute / cast chain, bit-identically. nullptr when it does not apply (SD_H3_VAE_FUSED_QKV=0).
         ggml_tensor* forward_head_major(GGMLRunnerContext* ctx,
                                         ggml_tensor* qkv,
                                         ggml_tensor* pe,
                                         ggml_tensor* rope_a,
                                         ggml_tensor* rope_b) {
-#ifdef SD_USE_UPSTREAM_GGML
+#ifndef SD_GGML_H3_FUSED_OPS
             return nullptr;
 #else
             static const bool enabled = [] {
@@ -324,14 +321,14 @@ namespace MiniMaxH3VAE {
                 return ggml_view_4d(ctx->ggml_ctx, qkv, head_dim, num_head, sequence, 1,
                                     qkv->nb[1], qkv->nb[2], qkv->nb[3], index * head_dim * sizeof(float));
             };
-            // q/k RMS norm folded into the RoPE op where the backend reproduces GGML_OP_RMS_NORM's
-            // arithmetic in it (SD_H3_VAE_FUSED_QK_NORM=0 keeps the separate norm).
+            ggml_tensor* q = nullptr;
+            ggml_tensor* k = nullptr;
+#ifdef SD_GGML_H3_FUSED_QK_NORM
+            // same reduction as GGML_OP_RMS_NORM where supported (SD_H3_VAE_FUSED_QK_NORM=0 keeps it separate)
             static const bool fuse_norm = [] {
                 const char* v = getenv("SD_H3_VAE_FUSED_QK_NORM");
                 return v == nullptr || v[0] == '\0' || atoi(v) != 0;
             }();
-            ggml_tensor* q = nullptr;
-            ggml_tensor* k = nullptr;
             if (fuse_norm) {
                 q = ggml_rope_pe_permute_rms(ctx->ggml_ctx, part(0), pe, n_rot, 1.f, GGML_TYPE_F32, 1e-5f);
                 k = ggml_rope_pe_permute_rms(ctx->ggml_ctx, part(1), pe, n_rot, kv_scale, GGML_TYPE_F16, 1e-5f);
@@ -339,6 +336,7 @@ namespace MiniMaxH3VAE {
                     q = k = nullptr;
                 }
             }
+#endif
             if (q == nullptr) {
                 q = ggml_rope_pe_permute(ctx->ggml_ctx, ggml_rms_norm(ctx->ggml_ctx, part(0), 1e-5f), pe, n_rot, 1.f, GGML_TYPE_F32);
                 k = ggml_rope_pe_permute(ctx->ggml_ctx, ggml_rms_norm(ctx->ggml_ctx, part(1), 1e-5f), pe, n_rot, kv_scale, GGML_TYPE_F16);
@@ -747,8 +745,7 @@ namespace MiniMaxH3VAE {
             params.tile_size_x     = 16;
             params.tile_size_y     = 16;
             params.target_overlap  = 0.25f;
-            // SD_H3_VAE_TILE=N: N x N latent tiles instead of 16 x 16 (opt-in; the tile seams move, so
-            // the frames are not bit-identical to the default)
+            // SD_H3_VAE_TILE=N: opt-in N x N latent tiles; the seams move, so frames differ from the default
             if (const char* tile = getenv("SD_H3_VAE_TILE")) {
                 const int n = atoi(tile);
                 if (n >= 8) {
@@ -886,8 +883,7 @@ namespace MiniMaxH3VAE {
                 {static_cast<int>(tokens_per_chunk + token_overlap), static_cast<int>(token_overlap)});
             GGML_ASSERT(plan.tiles.size() == static_cast<size_t>(num_chunks));
             const bool keep_resident = env_int("SD_H3_VAE_KEEP_RESIDENT", 1) != 0;
-            // One device free-memory reading serves every tile that allocates nothing new
-            // (SD_H3_VAE_REUSE_MEMQUERY=0 queries the device for every capacity check).
+            // SD_H3_VAE_REUSE_MEMQUERY=0 queries the device for every capacity check.
             set_reuse_device_query(env_int("SD_H3_VAE_REUSE_MEMQUERY", 1) != 0);
             struct ReuseQueryGuard {
                 GGMLRunner& runner;
@@ -898,9 +894,7 @@ namespace MiniMaxH3VAE {
             tile_batch_              = 0;
             per_tile_compute_bytes_  = 0;
             std::vector<sd::Tensor<float>> pieces;
-            // Trims the pre-padding frames of a decoded chunk and cross-fades it with the previous
-            // chunk's tail. Runs in chunk order; on a worker thread unless SD_H3_VAE_ASYNC_ASSEMBLY=0,
-            // so it overlaps the next chunk's decode (same arithmetic, bit-identical result).
+            // Runs in chunk order, on a worker thread unless SD_H3_VAE_ASYNC_ASSEMBLY=0.
             auto assemble = [&](const sd::Tensor<float>& decoded, const VAETemporalTile& tile) {
                 int64_t first_end = std::min<int64_t>(frames_per_chunk, decoded.shape()[2]);
                 auto first        = sd::ops::slice(decoded,
@@ -929,8 +923,7 @@ namespace MiniMaxH3VAE {
             bool assembly_failed = false;
             int64_t expected_frames = input.shape()[2] <= 1 ? 1 : ((x.shape()[2] - 2) / 5) * 17 + 5;
             expected_frames         = std::max<int64_t>(1, expected_frames);
-            // Pieces are copied straight into the trimmed output as they are assembled (the same
-            // frames concat_frames + slice would keep), instead of concatenated at the end.
+            // keeps the same frames concat_frames + slice would
             sd::Tensor<float> result;
             int64_t frame_offset = 0;
             auto append_piece    = [&](const sd::Tensor<float>& piece) {
@@ -1230,8 +1223,6 @@ namespace MiniMaxH3VAE {
             auto input           = ensure_video_shape(z);
             const bool graph_opt = decode_graph && env_int("SD_H3_VAE_GRAPH_OPT", 1) != 0;
             if (decode_graph) {
-                // Every spatial tile of a decode has the same extent, so the tables are rebuilt only
-                // when the tile shape (or the graph variant) changes.
                 const std::array<int64_t, 4> rope_key = {input.shape()[0], input.shape()[1], input.shape()[2], graph_opt ? 1 : 0};
                 if (rope_key != rope_key_ || rope_cache.empty()) {
                     rope_cache = build_rope(input.shape()[0],
