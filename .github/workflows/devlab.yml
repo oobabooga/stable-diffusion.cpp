@@ -1,0 +1,323 @@
+name: Stack 17-20 AMD devlab (throwaway)
+
+on:
+  push:
+    branches: [stack-p82-ci]
+
+permissions: {}
+
+env:
+  SHA_master: 6321a6935234c2bb09c77604874a439344faa7f6
+  SHA_pr17: ca92d95ddf041bf885a36a7fdafbffd88706c28e
+  SHA_pr18: 5f222b85a9b52e7d6f43fdffcb0772806459154b
+  SHA_pr19: 338079ece82649c7535da4bbba663f29b4bc1a25
+  SHA_pr20: aff34f1542edb66acf2f5bb5daae1c895db0afe4
+  ROCM_VERSION: 7.14.0
+
+jobs:
+  rocm:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: tooling
+      - name: Hardware
+        run: |
+          uname -a; nproc; free -h; df -h "$RUNNER_TEMP"
+          ls -l /dev/kfd /dev/dri 2>&1 || true
+          cat /sys/class/drm/card*/device/mem_info_vram_total 2>/dev/null || true
+      - name: Setup
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"/{tmp,hf,models,out}
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"
+          python -m pip install -q --upgrade pip
+          python -m pip install -q cmake ninja huggingface_hub hf_transfer numpy pillow
+          python -m pip install -q --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch/ "rocm[libraries,devel,device-gfx1151]==${ROCM_VERSION}"
+          R="$(rocm-sdk path --root)"
+          { echo "W=$W"; echo "M=$W/models"; echo "OUT=$W/out"; echo "ROCM_PATH=$R"; echo "HIP_PATH=$R"; echo "CMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)"; echo "LD_LIBRARY_PATH=$R/lib"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "HF_HUB_ENABLE_HF_TRANSFER=1"; } >> "$GITHUB_ENV"
+          { echo "$(rocm-sdk path --bin)"; echo "$W/venv/bin"; } >> "$GITHUB_PATH"
+      - name: Start model download
+        run: |
+          cd "$W"
+          nohup python -c "
+          from huggingface_hub import hf_hub_download as d
+          for f in ['vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors','minimax_h3_fl2va_pruned-UD-Q2_K_XL.gguf','qwen3vl_32b_minimax_h3-Q2_K_M.gguf']:
+              print(d('unsloth/MiniMax-H3-GGUF', f, local_dir='$M'), flush=True)
+          print('DONE', flush=True)
+          " > "$W/dl.log" 2>&1 &
+      - name: Sources and HIP builds
+        run: |
+          set -euo pipefail
+          . tooling/ci/h3.sh
+          for a in master:master:0 pr17:pr17:1 pr18:pr18:1 pr19:pr19:1 pr20:pr20:1 pr17u:pr17:0 pr20u:pr20:0; do
+            IFS=: read n h p <<< "$a"; eval "sha=\$SHA_$h"
+            fetch_src "$W/$n" "$sha" "$p"
+            T=sd-cli; case $n in master|pr20) T="sd-cli test-backend-ops";; esac
+            cmake -S "$W/$n" -B "$W/$n/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+              -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF \
+              -DSD_HIPBLAS=ON -DHIP_PLATFORM=amd -DGPU_TARGETS=gfx1151 -DGGML_BUILD_TESTS=ON > "$W/cmake-$n.log" 2>&1 || { tail -40 "$W/cmake-$n.log"; exit 1; }
+            grep -iE "fused|ggml lacks" "$W/cmake-$n.log" || true
+            cmake --build "$W/$n/build" -j 32 --target $T > "$W/build-$n.log" 2>&1 || { grep -E "error" "$W/build-$n.log" | head -40; exit 1; }
+            echo "built $n"
+          done
+      - name: test-backend-ops ROCm0 (master vs pr20)
+        run: |
+          set +e
+          for n in master pr20; do
+            timeout 2700 "$W/$n/build/bin/test-backend-ops" test -b ROCm0 > "$W/out/tbo-rocm-$n.log" 2>&1; echo "$n exit=$?"
+            grep -E "tests passed|backends passed" "$W/out/tbo-rocm-$n.log"
+            grep -E "FAIL" "$W/out/tbo-rocm-$n.log" | sed -E 's/ +/ /g' | sort > "$W/out/tbo-rocm-$n.fail"
+            echo "$n FAIL count: $(wc -l < "$W/out/tbo-rocm-$n.fail")"
+          done
+          echo "FAIL lines only in pr20:"; comm -13 "$W/out/tbo-rocm-master.fail" "$W/out/tbo-rocm-pr20.fail" | head -60
+          echo "new-op lines in pr20:"; grep -E "ROPE_PE_PERMUTE|MODULATE_ROWS|GATED_ADD_ROWS|SWIGLU_SCALED" "$W/out/tbo-rocm-pr20.log" | awk '{print $NF}' | sort | uniq -c
+          exit 0
+      - name: Renders
+        run: |
+          set -uo pipefail
+          . tooling/ci/h3.sh
+          for i in $(seq 1 120); do grep -q DONE "$W/dl.log" && break; sleep 30; done
+          cat "$W/dl.log"; grep -q DONE "$W/dl.log" || exit 1
+          B() { echo "$W/$1/build/bin/sd-cli"; }
+          render master "$(B master)" --diffusion-fa
+          render master_r "$(B master)" --diffusion-fa
+          render pr17 "$(B pr17)" --diffusion-fa
+          render pr18 "$(B pr18)" --diffusion-fa
+          render pr19 "$(B pr19)" --diffusion-fa
+          render pr20 "$(B pr20)" --diffusion-fa
+          render pr20_r "$(B pr20)" --diffusion-fa
+          ENVS="$ALL_OFF" render pr20_off "$(B pr20)" --diffusion-fa
+          render pr17u "$(B pr17u)" --diffusion-fa
+          render pr20u "$(B pr20u)" --diffusion-fa
+          render pr18_sage "$(B pr18)" --diffusion-fa --sage-attn
+          render pr19_sage "$(B pr19)" --diffusion-fa --sage-attn
+          ENVS="SD_H3_FAST_SAGE_QKV=0" render pr19_sage_off "$(B pr19)" --diffusion-fa --sage-attn
+          python tooling/ci/compare.py "$OUT" master:master_r pr20:pr20_r master:pr17 pr17:pr18 pr18:pr19 pr19:pr20 pr20:pr20_off pr17:pr20_off pr17u:pr20u pr17:pr17u pr20:pr20u pr18_sage:pr19_sage pr19_sage:pr19_sage_off pr18:pr18_sage | tee "$OUT/compare.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: rocm-logs
+          path: |
+            ${{ runner.temp }}/w/out/*.log
+            ${{ runner.temp }}/w/out/*.txt
+            ${{ runner.temp }}/w/out/*.fail
+            ${{ runner.temp }}/w/out/pr20/f_000.png
+            ${{ runner.temp }}/w/out/pr20/f_010.png
+          retention-days: 5
+
+  vulkan-cpu:
+    runs-on: [self-hosted, Linux, strix-halo, devlab-dispatch]
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: 241e75b56c91c0d210ed07a7c638ec05a3e5b0e4c66ba9f0ba0f102d823ad6bf
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: tooling
+      - name: Hardware and Vulkan probe
+        run: |
+          uname -a; nproc; free -h; df -h "$RUNNER_TEMP"
+          ls /usr/share/vulkan/icd.d /etc/vulkan/icd.d 2>&1 || true
+          ldconfig -p | grep -iE "vulkan|radv" || true
+      - name: Setup
+        run: |
+          set -euo pipefail
+          W="$RUNNER_TEMP/w"; mkdir -p "$W"/{tmp,hf,models,out}
+          python3 -m venv "$W/venv"; . "$W/venv/bin/activate"
+          python -m pip install -q --upgrade pip
+          python -m pip install -q cmake ninja huggingface_hub hf_transfer numpy pillow
+          archive="$W/vulkansdk.tar.xz"; sdk_root="$W/vulkansdk"
+          curl --fail --location --retry 3 --output "$archive" "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/linux/vulkansdk-linux-x86_64-${VULKAN_VERSION}.tar.xz"
+          echo "$VULKAN_SHA256  $archive" | sha256sum --check --strict
+          mkdir -p "$sdk_root"; tar -xJf "$archive" -C "$sdk_root" --strip-components=1
+          { echo "W=$W"; echo "M=$W/models"; echo "OUT=$W/out"; echo "VULKAN_SDK=$sdk_root/x86_64"; echo "LD_LIBRARY_PATH=$sdk_root/x86_64/lib"; echo "TMPDIR=$W/tmp"; echo "HF_HOME=$W/hf"; echo "HF_HUB_ENABLE_HF_TRANSFER=1"; } >> "$GITHUB_ENV"
+          { echo "$sdk_root/x86_64/bin"; echo "$W/venv/bin"; } >> "$GITHUB_PATH"
+          "$sdk_root/x86_64/bin/vulkaninfo" --summary 2>&1 | head -30 || true
+      - name: Start model download
+        run: |
+          cd "$W"
+          nohup python -c "
+          from huggingface_hub import hf_hub_download as d
+          for f in ['vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors','minimax_h3_fl2va_pruned-UD-Q2_K_XL.gguf','qwen3vl_32b_minimax_h3-Q2_K_M.gguf']:
+              print(d('unsloth/MiniMax-H3-GGUF', f, local_dir='$M'), flush=True)
+          print('DONE', flush=True)
+          " > "$W/dl.log" 2>&1 &
+      - name: Sources and builds
+        run: |
+          set -euo pipefail
+          . tooling/ci/h3.sh
+          for a in master:0 pr17:1 pr18:1 pr19:1 pr20:1; do
+            IFS=: read n p <<< "$a"; eval "sha=\$SHA_$n"
+            fetch_src "$W/$n" "$sha" "$p"
+            T=sd-cli; case $n in master|pr20) T="sd-cli test-backend-ops";; esac
+            cmake -S "$W/$n" -B "$W/$n/bvk" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF \
+              -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF -DSD_VULKAN=ON -DGGML_BUILD_TESTS=ON > "$W/cmake-vk-$n.log" 2>&1 || { tail -40 "$W/cmake-vk-$n.log"; exit 1; }
+            cmake --build "$W/$n/bvk" -j 32 --target $T > "$W/build-vk-$n.log" 2>&1 || { grep -E "error" "$W/build-vk-$n.log" | head -40; exit 1; }
+            case $n in pr17|pr18|pr19)
+              cmake -S "$W/$n" -B "$W/$n/bcpu" -G Ninja -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF \
+                -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF > "$W/cmake-cpu-$n.log" 2>&1
+              cmake --build "$W/$n/bcpu" -j 32 --target sd-cli > "$W/build-cpu-$n.log" 2>&1 || { grep -E "error" "$W/build-cpu-$n.log" | head -40; exit 1; };;
+            esac
+            echo "built $n"
+          done
+      - name: test-backend-ops Vulkan0 (master vs pr20)
+        run: |
+          set +e
+          for n in master pr20; do
+            timeout 2700 "$W/$n/bvk/bin/test-backend-ops" test -b Vulkan0 > "$W/out/tbo-vk-$n.log" 2>&1; echo "$n exit=$?"
+            grep -E "Backend|tests passed|backends passed" "$W/out/tbo-vk-$n.log" | head
+            grep -E "FAIL" "$W/out/tbo-vk-$n.log" | sed -E 's/ +/ /g' | sort > "$W/out/tbo-vk-$n.fail"
+            echo "$n FAIL count: $(wc -l < "$W/out/tbo-vk-$n.fail")"
+          done
+          echo "FAIL lines only in pr20:"; comm -13 "$W/out/tbo-vk-master.fail" "$W/out/tbo-vk-pr20.fail" | head -60
+          exit 0
+      - name: Vulkan renders
+        run: |
+          set -uo pipefail
+          . tooling/ci/h3.sh
+          for i in $(seq 1 120); do grep -q DONE "$W/dl.log" && break; sleep 30; done
+          cat "$W/dl.log"; grep -q DONE "$W/dl.log" || exit 1
+          B() { echo "$W/$1/bvk/bin/sd-cli"; }
+          render vk_master "$(B master)" --diffusion-fa
+          render vk_pr17 "$(B pr17)" --diffusion-fa
+          render vk_pr18 "$(B pr18)" --diffusion-fa
+          render vk_pr19 "$(B pr19)" --diffusion-fa
+          render vk_pr20 "$(B pr20)" --diffusion-fa
+          render vk_pr20_r "$(B pr20)" --diffusion-fa
+          ENVS="$ALL_OFF" render vk_pr20_off "$(B pr20)" --diffusion-fa
+          python tooling/ci/compare.py "$OUT" vk_pr20:vk_pr20_r vk_master:vk_pr17 vk_pr17:vk_pr18 vk_pr18:vk_pr19 vk_pr19:vk_pr20 vk_pr20:vk_pr20_off vk_pr17:vk_pr20_off | tee "$OUT/compare-vk.txt"
+      - name: CPU renders
+        run: |
+          set -uo pipefail
+          . tooling/ci/h3.sh
+          export H3_W=320 H3_H=192 H3_F=9 H3_STEPS=1
+          B() { echo "$W/$1/bcpu/bin/sd-cli"; }
+          render cpu_pr17 "$(B pr17)" --diffusion-fa -t 32
+          render cpu_pr18 "$(B pr18)" --diffusion-fa -t 32
+          render cpu_pr18_r "$(B pr18)" --diffusion-fa -t 32
+          render cpu_pr19 "$(B pr19)" --diffusion-fa -t 32
+          ENVS="$ALL_OFF" render cpu_pr19_off "$(B pr19)" --diffusion-fa -t 32
+          python tooling/ci/compare.py "$OUT" cpu_pr18:cpu_pr18_r cpu_pr17:cpu_pr18 cpu_pr18:cpu_pr19 cpu_pr19:cpu_pr19_off cpu_pr17:cpu_pr19_off | tee "$OUT/compare-cpu.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: vulkan-cpu-logs
+          path: |
+            ${{ runner.temp }}/w/out/*.log
+            ${{ runner.temp }}/w/out/*.txt
+            ${{ runner.temp }}/w/out/*.fail
+            ${{ runner.temp }}/w/out/vk_pr20/f_000.png
+          retention-days: 5
+
+  windows-vulkan:
+    runs-on: [self-hosted, Windows, strix-halo, devlab-dispatch]
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    env:
+      VULKAN_VERSION: 1.4.328.1
+      VULKAN_SHA256: a8675df6d538079c2a719a9373994948091db785b48f142e024254e76348d16c
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: tooling
+      - name: Setup
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $W = Join-Path $env:RUNNER_TEMP 'w'; New-Item -ItemType Directory -Force -Path "$W\models","$W\out","$W\hf" | Out-Null
+          python -m venv "$W\venv"; & "$W\venv\Scripts\python.exe" -m pip install -q huggingface_hub hf_transfer numpy pillow
+          $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-Installer.exe'; $sdkRoot = Join-Path $env:RUNNER_TEMP 'VulkanSDK'
+          curl.exe --fail --location --retry 3 --output $installer "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ne $env:VULKAN_SHA256) { throw 'Vulkan SDK SHA256 mismatch' }
+          $p = Start-Process -FilePath $installer -ArgumentList @('--root', "`"$sdkRoot`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkRoot"; Add-Content $env:GITHUB_ENV "W=$W"; Add-Content $env:GITHUB_ENV "HF_HOME=$W\hf"; Add-Content $env:GITHUB_ENV "HF_HUB_ENABLE_HF_TRANSFER=1"
+          Add-Content $env:GITHUB_PATH "$sdkRoot\Bin"
+          & "$sdkRoot\Bin\vulkaninfo.exe" --summary 2>&1 | Select-Object -First 30
+          exit 0
+      - name: Start model download
+        shell: powershell
+        run: |
+          $code = "from huggingface_hub import hf_hub_download as d`nfor f in ['vae/minimax_h3_video_vae_fp16.safetensors','vae/minimax_h3_audio_vae_fp32.safetensors','minimax_h3_fl2va_pruned-UD-Q2_K_XL.gguf','qwen3vl_32b_minimax_h3-Q2_K_M.gguf']:`n    print(d('unsloth/MiniMax-H3-GGUF', f, local_dir=r'$env:W\models'), flush=True)`nprint('DONE', flush=True)"
+          Set-Content -Path "$env:W\dl.py" -Value $code
+          Start-Process -FilePath "$env:W\venv\Scripts\python.exe" -ArgumentList "$env:W\dl.py" -RedirectStandardOutput "$env:W\dl.log" -RedirectStandardError "$env:W\dl.err" -WindowStyle Hidden
+      - name: Sources and MSVC Vulkan builds
+        shell: cmd
+        run: |
+          for %%N in (master pr20) do (
+            if "%%N"=="master" (set SHA=%SHA_master%) else (set SHA=%SHA_pr20%)
+            call :one %%N || exit /b 1
+          )
+          exit /b 0
+          :one
+          setlocal EnableDelayedExpansion
+          set N=%1
+          if "%N%"=="master" (set SHA=%SHA_master%) else (set SHA=%SHA_pr20%)
+          git init -q %W%\%N% || exit /b 1
+          git -C %W%\%N% remote add origin https://github.com/unslothai/stable-diffusion.cpp
+          git -C %W%\%N% fetch -q --depth 1 origin !SHA! || exit /b 1
+          git -C %W%\%N% checkout -q FETCH_HEAD || exit /b 1
+          git -C %W%\%N% submodule update --init --depth 1 ggml || exit /b 1
+          for %%P in (%W%\%N%\scripts\unsloth\ggml-patches\*.patch) do (
+            git -C %W%\%N%\ggml apply %%P || (echo PATCH FAILED %%P & exit /b 1)
+            echo applied %%~nxP
+          )
+          cmake -S %W%\%N% -B %W%\%N%\build -G "Visual Studio 17 2022" -A x64 -DSD_VULKAN=ON -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF -DGGML_NATIVE=OFF -DGGML_BUILD_TESTS=ON > %W%\cmake-%N%.log 2>&1 || (type %W%\cmake-%N%.log & exit /b 1)
+          cmake --build %W%\%N%\build --config Release -j 16 --target sd-cli test-backend-ops > %W%\build-%N%.log 2>&1 || (findstr /I " error " %W%\build-%N%.log & exit /b 1)
+          echo built %N%
+          exit /b 0
+      - name: test-backend-ops Vulkan0 (master vs pr20)
+        shell: powershell
+        run: |
+          foreach ($n in 'master','pr20') {
+            & "$env:W\$n\build\bin\Release\test-backend-ops.exe" test -b Vulkan0 *> "$env:W\out\tbo-winvk-$n.log"
+            "$n exit=$LASTEXITCODE"
+            Select-String -Path "$env:W\out\tbo-winvk-$n.log" -Pattern 'tests passed|backends passed|Backend ' | Select-Object -First 8 | ForEach-Object { $_.Line }
+            $f = Select-String -Path "$env:W\out\tbo-winvk-$n.log" -Pattern 'FAIL' | ForEach-Object { ($_.Line -replace '\s+',' ').Trim() } | Sort-Object
+            Set-Content -Path "$env:W\out\tbo-winvk-$n.fail" -Value $f
+            "$n FAIL count: $(@($f).Count)"
+          }
+          $a = Get-Content "$env:W\out\tbo-winvk-master.fail"; $b = Get-Content "$env:W\out\tbo-winvk-pr20.fail"
+          "FAIL lines only in pr20:"; Compare-Object @($a) @($b) | Where-Object SideIndicator -eq '=>' | Select-Object -First 60 | ForEach-Object { $_.InputObject }
+          exit 0
+      - name: Renders
+        shell: powershell
+        run: |
+          for ($i = 0; $i -lt 160; $i++) { if ((Test-Path "$env:W\dl.log") -and (Select-String -Path "$env:W\dl.log" -Pattern 'DONE' -Quiet)) { break }; Start-Sleep 30 }
+          Get-Content "$env:W\dl.log"; Get-Content "$env:W\dl.err" -ErrorAction SilentlyContinue | Select-Object -Last 5
+          $M = "$env:W\models"
+          $off = 'SD_H3_GRAPH_FAST=0 SD_H3_FAST_SAGE_QKV=0 SD_H3_VAE_GRAPH_OPT=0 SD_H3_VAE_FUSED_QKV=0 SD_H3_VAE_FUSED_QK_NORM=0 SD_TILE_ASYNC_MERGE=0 SD_H3_VAE_ASYNC_ASSEMBLY=0 SD_H3_VAE_REUSE_MEMQUERY=0 SD_H3_VAE_KEEP_RESIDENT=0 SD_H3_AUDIO_DIRECT_DW=0'
+          function Render($name, $bin, $envs) {
+            New-Item -ItemType Directory -Force -Path "$env:W\out\$name" | Out-Null
+            $saved = @{}
+            foreach ($kv in ($envs -split ' ' | Where-Object { $_ })) { $k,$v = $kv -split '=',2; $saved[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $v) }
+            $t0 = Get-Date
+            & $bin -M vid_gen --diffusion-model "$M\minimax_h3_fl2va_pruned-UD-Q2_K_XL.gguf" --vae "$M\vae\minimax_h3_video_vae_fp16.safetensors" --audio-vae "$M\vae\minimax_h3_audio_vae_fp32.safetensors" --llm "$M\qwen3vl_32b_minimax_h3-Q2_K_M.gguf" -p "A red fox runs through fresh snow in a pine forest, soft morning light, wind and crunching snow sounds." --cfg-scale 1.0 -W 480 -H 272 --video-frames 22 --steps 2 --seed 42 --rng cpu --fps 24 --diffusion-fa -o "$env:W\out\$name\f_%03d.png" *> "$env:W\out\$name.log"
+            $rc = $LASTEXITCODE
+            foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
+            "RENDER $name rc=$rc files=$((Get-ChildItem "$env:W\out\$name").Count) secs=$([int]((Get-Date)-$t0).TotalSeconds) env=[$envs]"
+            Select-String -Path "$env:W\out\$name.log" -Pattern 'error|assert|abort|not supported|Using flash' | Select-Object -First 8 | ForEach-Object { $_.Line }
+          }
+          Render 'win_master' "$env:W\master\build\bin\Release\sd-cli.exe" ''
+          Render 'win_pr20' "$env:W\pr20\build\bin\Release\sd-cli.exe" ''
+          Render 'win_pr20_r' "$env:W\pr20\build\bin\Release\sd-cli.exe" ''
+          Render 'win_pr20_off' "$env:W\pr20\build\bin\Release\sd-cli.exe" $off
+          & "$env:W\venv\Scripts\python.exe" tooling\ci\compare.py "$env:W\out" win_pr20:win_pr20_r win_master:win_pr20 win_pr20:win_pr20_off | Tee-Object -FilePath "$env:W\out\compare-win.txt"
+          exit 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: windows-vulkan-logs
+          path: |
+            ${{ runner.temp }}/w/out/*.log
+            ${{ runner.temp }}/w/out/*.txt
+            ${{ runner.temp }}/w/out/*.fail
+          retention-days: 5
