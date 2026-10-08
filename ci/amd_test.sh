@@ -70,6 +70,11 @@ done
 
 # Hosts without a ROCm userspace (what the bundling is for): a bare container with only the GPU
 # device nodes. Also a 22.04 container for the glibc floor.
+# A desktop always has libgomp/libstdc++, so the bare images get libgomp1 and nothing else.
+for v in 24.04 22.04; do
+  printf 'FROM ubuntu:%s\nRUN apt-get update -qq && apt-get install -y -qq libgomp1 >/dev/null && rm -rf /var/lib/apt/lists/*\n' "$v" \
+    | docker build -q -t "bare:$v" - >/dev/null && echo "built bare:$v"
+done
 KFD_GID="$(stat -c %g /dev/kfd)"; REN_GID="$(stat -c %g "$(ls /dev/dri/renderD* | head -1)")"
 dock() { local img="$1" dir="$2"; shift 2
   docker run --rm --device /dev/kfd --device /dev/dri --group-add "$KFD_GID" --group-add "$REN_GID" \
@@ -78,7 +83,7 @@ dock() { local img="$1" dir="$2"; shift 2
 for b in pr_rocm up_rocm; do
   [ -n "${CLI[$b]:-}" ] || continue
   d="$(dirname "${CLI[$b]}")"
-  for img in ubuntu:24.04 ubuntu:22.04; do
+  for img in bare:24.04 bare:22.04; do
     sec "$b in bare $img (no ROCm userspace)"
     dock "$img" "$d" sh -c 'ls /opt/rocm 2>&1 | head -1; ldd /b/sd-cli | grep -E "not found|amdhip|rocblas" ; /b/sd-cli --list-devices; echo exit=$?'
   done
@@ -104,7 +109,7 @@ run() { local name="$1" mode="$2" b="$3"; shift 3
   case "$mode" in
     host)   ( cd /; LD_LIBRARY_PATH="$d" timeout 1200 "$c" "${@//\/m\//$W/models/}" -o "$OUT/$name.png" ) > "$OUT/$name.log" 2>&1; rc=$? ;;
     shadow) ( cd /; LD_LIBRARY_PATH="$d:/opt/rocm/lib" timeout 1200 "$c" "${@//\/m\//$W/models/}" -o "$OUT/$name.png" ) > "$OUT/$name.log" 2>&1; rc=$? ;;
-    bare)   dock ubuntu:24.04 "$d" timeout 1200 /b/sd-cli "$@" -o "/o/$name.png" > "$OUT/$name.log" 2>&1; rc=$? ;;
+    bare)   dock bare:24.04 "$d" timeout 1200 /b/sd-cli "$@" -o "/o/$name.png" > "$OUT/$name.log" 2>&1; rc=$? ;;
   esac
   echo "rc=$rc wall=$((SECONDS - t0))s"
   grep -iE 'rocm devices|found [0-9]+ |vulkan0|using .*backend|gfx|error|fail|abort|sampling completed|decode_first_stage completed|generate_image completed|completed, taking|total' "$OUT/$name.log" | grep -v '^\s*$' | tail -14
