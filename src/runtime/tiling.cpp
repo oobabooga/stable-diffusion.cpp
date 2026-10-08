@@ -79,8 +79,7 @@ static sd::Tensor<float> sd_tensor_split_2d(const sd::Tensor<float>& input, int 
     int64_t input_plane  = sd_tensor_plane_size(input);
     int64_t output_plane = sd_tensor_plane_size(output);
     int64_t plane_count  = input.numel() / input_plane;
-    // Plane-outer order: a plane is contiguous, so the inner loop streams instead of striding a
-    // whole plane per element (a video tile has frames x channels planes).
+    // Plane-outer: planes are contiguous, so the inner loop streams instead of striding a plane per element.
     std::vector<int64_t> src_x(static_cast<size_t>(width));
     for (int ix = 0; ix < width; ix++) {
         src_x[ix] = (ix + x) % input_width;
@@ -147,8 +146,7 @@ static void sd_tensor_merge_2d(const float* input_data,
         return x * x * x * (x * (6.0f * x - 15.0f) + 10.0f);
     };
 
-    // Weights depend on ix or iy only; precompute them and walk each contiguous plane row by row.
-    // Same arithmetic per element as the per-pixel form, so the result is bit-identical.
+    // Same per-element arithmetic as the per-pixel form, so the result stays bit-identical.
     const bool blend = overlap_x > 0 || overlap_y > 0;
     std::vector<float> wx, wy;
     std::vector<int64_t> dst_x(static_cast<size_t>(width));

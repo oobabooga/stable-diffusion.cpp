@@ -116,6 +116,12 @@ which makes the audio decode several times faster. The input is no longer rounde
 the waveform differs slightly from the previous graph (about 41 dB SNR on a 5 s clip).
 `SD_H3_AUDIO_DIRECT_DW=0` restores the previous graph; backends without `CONV_2D_DW` keep it.
 
+The long-sequence flash attention kernel, the fused cuBLAS epilogues and the fused DiT ops come from
+the ggml patches in `scripts/unsloth/ggml-patches`, which the Unsloth prebuilt binaries carry. A
+source build gets them by applying the patches to the `ggml` submodule before configuring
+(`for p in scripts/unsloth/ggml-patches/*.patch; do git -C ggml apply "../$p"; done`); without
+them the build uses the stock ggml kernels and the unfused DiT graph.
+
 ## First/last-frame conditioning
 
 Add `--init-img` for I2VA, or both `--init-img` and `--end-img` for FL2VA:
