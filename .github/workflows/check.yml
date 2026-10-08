@@ -79,10 +79,8 @@ jobs:
             -DGGML_CUDA_CUDNN_INCLUDE_DIR="$CUDNN_INCLUDE_DIR" -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHS" 2>&1 | tee cmake.log | grep -i -E "cudnn|cuda toolkit|error" || true
       - name: Compile the cuDNN graph object first
         working-directory: src
-        run: |
-          set -o pipefail
-          make -C build ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/build.make >/dev/null 2>&1 || true
-          cd build/ggml/src/ggml-cuda && make -f CMakeFiles/ggml-cuda.dir/build.make CMakeFiles/ggml-cuda.dir/cudnn-attn-graph.cpp.o 2>&1 | tail -30
+        continue-on-error: true
+        run: make -C build/ggml/src/ggml-cuda cudnn-attn-graph.cpp.o 2>&1 | tail -30; exit ${PIPESTATUS[0]}
       - name: Build sd-cli + sd-server
         working-directory: src
         run: cmake --build build --config Release -j "$(nproc)" --target sd-cli sd-server 2>&1 | grep -E "error|Error|Built target sd-" | head -40; test -x build/bin/sd-cli
