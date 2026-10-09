@@ -46,9 +46,11 @@ are detected from their weights.
 Omitting `--audio-vae` still runs the joint diffusion model but produces video without a
 decoded audio track.
 
-`--diffusion-fa` also enables flash attention in the video VAE decoder (a ViT), which removes
-most of its attention cost without touching the text encoder. Set `SD_H3_VAE_FLASH_ATTN=0`
-to decode with the previous mul_mat + softmax attention.
+On CUDA and ROCm, `--diffusion-fa` also enables flash attention in the video VAE decoder (a ViT),
+which removes most of its attention cost without touching the text encoder. Set
+`SD_H3_VAE_FLASH_ATTN=0` to decode with the previous mul_mat + softmax attention. Other backends
+keep that attention by default (on Vulkan the flash attention decode was slower);
+`SD_H3_VAE_FLASH_ATTN=1` turns it on there.
 
 ## First/last-frame conditioning
 
