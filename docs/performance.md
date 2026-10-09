@@ -48,7 +48,12 @@ value. Values up to and including 1 specify a fraction of the current input size
 values greater than 1 specify a target number of tiles per axis, accounting for
 overlap. For example, `0.5x0.5` uses half the width and height in both encode and
 decode. The target overlap is clamped to 0 through 0.5 and the actual overlap is
-adjusted to fit the image. Size and overlap options require `--vae-tiling`.
+adjusted to fit the image. On an axis that does not wrap, a tile size that would leave
+neighboring tiles overlapping by less than half the target (or by fewer than 2 latent
+pixels) is adjusted to the nearest size that does not: smaller first, larger only up to
+twice the requested size. Without it, a tile a little over half of the axis gives two
+tiles that barely overlap and the tile edge shows as a line. Size and overlap options
+require `--vae-tiling`.
 
 **Migration:** `--vae-tile-size` and the C/JSON fields `tile_size_w` and
 `tile_size_h` now use image pixels instead of latent units. The C/JSON fields
@@ -57,12 +62,13 @@ adjusted to fit the image. Size and overlap options require `--vae-tiling`.
 decode tile size of 32 corresponds to 256 pixels for an 8x VAE or 512 pixels for a
 16x VAE. Encoding no longer enlarges explicit or relative tile sizes.
 
-The main VAE decode path retries allocation failures with smaller tiles, even
-without `--vae-tiling`. Supported video VAEs first try temporal tiling; spatial
+The main VAE decode and encode paths retry allocation failures with smaller tiles,
+even without `--vae-tiling`. Supported video VAEs first try temporal tiling; spatial
 retries use at most 256-pixel tiles initially and then halve the effective tile
 dimensions down to the minimum size. Each spatial retry must reduce the effective
 tile size. These runtime adjustments do not change the caller's parameters.
-Execution failures are not retried, and encoding has no automatic OOM retry.
+Execution failures are not retried. Encoding retries the same way, without the
+temporal step.
 
 `--temporal-tiling` remains independent of spatial tiling. MiniMax H3 always uses
 spatial tiling (256x256 pixels and 25% overlap by default) and its own temporal
