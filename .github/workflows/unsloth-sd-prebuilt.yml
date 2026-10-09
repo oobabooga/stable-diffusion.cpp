@@ -425,7 +425,8 @@ jobs:
           # prefix (it ships as libcublas / libcublas-dev), so it has to go in the
           # other list or apt cannot find it. cudart-dev is what carries the headers;
           # cudart alone is the runtime and does not compile anything.
-          sub-packages: '["nvcc", "cudart", "cudart-dev", "thrust"]'
+          # nvrtc-dev: cudnn-frontend's headers include nvrtc.h (it dlopens libnvrtc itself, so nothing links it).
+          sub-packages: '["nvcc", "cudart", "cudart-dev", "thrust", "nvrtc-dev"]'
           non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
 
       # This leg rebuilt every object on every run: 3903 s of the 4121 s job on
@@ -527,11 +528,11 @@ jobs:
             patchelf --set-rpath '$ORIGIN' "$BIN/$exe"
           done
           ldd "$BIN/sd-cli" | sed -n '1,40p'
-          # cuDNN is opened at run time only; a link-time dependency would stop the binaries
+          # cuDNN and NVRTC are opened at run time only; a link-time dependency would stop the binaries
           # loading on every host without it.
           for exe in sd-cli sd-server; do
-            if readelf -d "$BIN/$exe" | grep -q 'NEEDED.*cudnn'; then
-              echo "ERROR: $exe links libcudnn; it must stay a run-time dlopen" >&2
+            if readelf -d "$BIN/$exe" | grep -qE 'NEEDED.*(cudnn|nvrtc)'; then
+              echo "ERROR: $exe links libcudnn or libnvrtc; they must stay run-time dlopens" >&2
               exit 1
             fi
           done
