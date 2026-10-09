@@ -479,26 +479,55 @@ namespace sd::backend_fit {
     }
 
     bool prepare_vae_decode_retry_tiling(sd_tiling_params_t& tiling_params, bool prefer_temporal_tiling) {
-        const char* retry_mode = nullptr;
+        return prepare_vae_retry_tiling(tiling_params, prefer_temporal_tiling, false);
+    }
+
+    bool prepare_vae_retry_tiling(sd_tiling_params_t& tiling_params, bool prefer_temporal_tiling, bool encode) {
+        // Spatial retry tiles are a fraction of the latent: half of it for decode. Image VAE encode tiles are
+        // scaled up 2x by get_tile_sizes, so encode starts a step lower to actually split the image.
+        // get_tile_sizes keeps the tiles overlapping (sd_tiling_seam_safe_tile_size), so a fractional tile never
+        // collapses into two tiles that meet edge to edge. If a retry still fails, the tiles are halved again
+        // down to an eighth of the latent before giving up.
+        const float first_rel_size = encode ? 0.25f : 0.5f;
+        const float min_rel_size   = 0.125f;
+        const char* stage          = encode ? "encode" : "decode";
+        const char* retry_mode     = nullptr;
         if (prefer_temporal_tiling && !tiling_params.temporal_tiling) {
             tiling_params.temporal_tiling = true;
             retry_mode                    = tiling_params.enabled ? "spatial+temporal" : "temporal";
         } else if (!tiling_params.enabled) {
             tiling_params.enabled    = true;
-            tiling_params.rel_size_x = 0.5f;
-            tiling_params.rel_size_y = 0.5f;
+            tiling_params.rel_size_x = first_rel_size;
+            tiling_params.rel_size_y = first_rel_size;
             if (tiling_params.tile_size_x <= 0) {
                 tiling_params.tile_size_x = 256;
             }
             if (tiling_params.tile_size_y <= 0) {
                 tiling_params.tile_size_y = 256;
             }
+            if (tiling_params.target_overlap <= 0.f) {
+                tiling_params.target_overlap = 0.5f;
+            }
             retry_mode = tiling_params.temporal_tiling ? "spatial+temporal" : "spatial";
+        } else if (tiling_params.rel_size_x > 0.f && tiling_params.rel_size_x <= 1.f &&
+                   tiling_params.rel_size_y > 0.f && tiling_params.rel_size_y <= 1.f &&
+                   std::max(tiling_params.rel_size_x, tiling_params.rel_size_y) > min_rel_size) {
+            tiling_params.rel_size_x = std::max(tiling_params.rel_size_x * 0.5f, min_rel_size);
+            tiling_params.rel_size_y = std::max(tiling_params.rel_size_y * 0.5f, min_rel_size);
+            if (tiling_params.target_overlap <= 0.f) {
+                tiling_params.target_overlap = 0.5f;
+            }
+            LOG_WARN("VAE %s failed (likely out of memory); retrying with smaller tiles (%.3g x %.3g of the latent)",
+                     stage,
+                     tiling_params.rel_size_x,
+                     tiling_params.rel_size_y);
+            return true;
         } else {
             return false;
         }
 
-        LOG_WARN("VAE decode failed (likely out of memory); retrying with %s tiling",
+        LOG_WARN("VAE %s failed (likely out of memory); retrying with %s tiling",
+                 stage,
                  retry_mode);
         return true;
     }
