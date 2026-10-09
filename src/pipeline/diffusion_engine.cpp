@@ -2754,6 +2754,13 @@ int StableDiffusionGGML::align_video_frames(int frames) {
 
 sd::Tensor<float> StableDiffusionGGML::encode_to_vae_latents(const sd::Tensor<float>& x) {
     auto latents = first_stage_model->encode(n_threads, x, vae_tiling_params, circular_x, circular_y);
+    // Same fallback as decode_first_stage, on a copy: an encode that ran out of memory is retried with
+    // overlapping tiles for this call only.
+    sd_tiling_params_t retry_tiling_params = vae_tiling_params;
+    while (latents.empty() &&
+           sd::backend_fit::prepare_vae_retry_tiling(retry_tiling_params, false, true)) {
+        latents = first_stage_model->encode(n_threads, x, retry_tiling_params, circular_x, circular_y);
+    }
     if (latents.empty()) {
         return {};
     }
