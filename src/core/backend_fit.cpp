@@ -512,8 +512,10 @@ namespace sd::backend_fit {
         } else if (tiling_params.rel_size_x > 0.f && tiling_params.rel_size_x <= 1.f &&
                    tiling_params.rel_size_y > 0.f && tiling_params.rel_size_y <= 1.f &&
                    std::max(tiling_params.rel_size_x, tiling_params.rel_size_y) > min_rel_size) {
-            tiling_params.rel_size_x = std::max(tiling_params.rel_size_x * 0.5f, min_rel_size);
-            tiling_params.rel_size_y = std::max(tiling_params.rel_size_y * 0.5f, min_rel_size);
+            // An axis already below the floor keeps its size: clamping it up would grow the tile that just failed.
+            auto shrink              = [&](float rel) { return rel > min_rel_size ? std::max(rel * 0.5f, min_rel_size) : rel; };
+            tiling_params.rel_size_x = shrink(tiling_params.rel_size_x);
+            tiling_params.rel_size_y = shrink(tiling_params.rel_size_y);
             if (tiling_params.target_overlap <= 0.f) {
                 tiling_params.target_overlap = 0.5f;
             }

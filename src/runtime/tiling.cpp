@@ -62,8 +62,8 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
     // sd_tiling_calc_tiles lets the real overlap fall well below the target for some sizes. The worst case is a
     // tile a little over half of the axis (e.g. round(dim / 2)): it falls back to two tiles overlapping by
     // 2 * tile_size - small_dim, which is 0 or 1 latent, so the cross-fade has nothing to blend over and the tile
-    // edge shows as a line. Pick the nearest tile size (smaller first, so memory use never grows unless nothing
-    // smaller works) whose tiles overlap by at least half the target and never by less than 2 latents.
+    // edge shows as a line. Pick the nearest tile size (smaller first; a larger one only up to twice the request,
+    // so an explicitly small tile cannot balloon) whose tiles overlap by at least half the target and by 2+ latents.
     const int min_tile_size = 4;
     if (tile_overlap_factor <= 0.f || tile_size >= small_dim) {
         return tile_size;
@@ -81,7 +81,7 @@ int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overl
             return size;
         }
     }
-    for (int size = tile_size + 1; size < small_dim; ++size) {
+    for (int size = tile_size + 1; size < small_dim && size <= 2 * tile_size; ++size) {
         if (overlaps_enough(size)) {
             return size;
         }
