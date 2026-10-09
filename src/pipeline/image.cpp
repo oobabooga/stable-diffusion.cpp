@@ -43,7 +43,10 @@ namespace sd::pipeline {
                                               overlap,
                                               sd_img_gen_params->vae_tiling_params,
                                               latent_size_x,
-                                              latent_size_y);
+                                              latent_size_y,
+                                              1.0f,
+                                              sd->circular_x,
+                                              sd->circular_y);
 
         sd->circular_x = sd->circular_x && (tile_size_x >= latent_size_x);
         sd->circular_y = sd->circular_y && (tile_size_y >= latent_size_y);

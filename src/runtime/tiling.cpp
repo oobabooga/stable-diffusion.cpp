@@ -58,6 +58,37 @@ static void sd_tiling_calc_tiles(int& num_tiles_dim,
     }
 }
 
+int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor) {
+    // sd_tiling_calc_tiles lets the real overlap fall well below the target for some sizes. The worst case is a
+    // tile a little over half of the axis (e.g. round(dim / 2)): it falls back to two tiles overlapping by
+    // 2 * tile_size - small_dim, which is 0 or 1 latent, so the cross-fade has nothing to blend over and the tile
+    // edge shows as a line. Pick the nearest tile size (smaller first; a larger one only up to twice the request,
+    // so an explicitly small tile cannot balloon) whose tiles overlap by at least half the target and by 2+ latents.
+    const int min_tile_size = 4;
+    if (tile_overlap_factor <= 0.f || tile_size >= small_dim) {
+        return tile_size;
+    }
+    auto overlaps_enough = [&](int size) {
+        int num_tiles;
+        float overlap_factor;
+        sd_tiling_calc_tiles(num_tiles, overlap_factor, small_dim, size, tile_overlap_factor, false);
+        const int overlap     = static_cast<int>(size * overlap_factor);
+        const int min_overlap = std::max(2, static_cast<int>(size * tile_overlap_factor * 0.5f));
+        return num_tiles < 2 || overlap >= min_overlap;
+    };
+    for (int size = tile_size; size >= min_tile_size; --size) {
+        if (overlaps_enough(size)) {
+            return size;
+        }
+    }
+    for (int size = tile_size + 1; size < small_dim && size <= 2 * tile_size; ++size) {
+        if (overlaps_enough(size)) {
+            return size;
+        }
+    }
+    return tile_size;
+}
+
 static int64_t sd_tensor_plane_size(const sd::Tensor<float>& tensor) {
     GGML_ASSERT(tensor.dim() >= 2);
     return tensor.shape()[0] * tensor.shape()[1];

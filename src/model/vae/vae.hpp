@@ -184,7 +184,9 @@ public:
                         const sd_tiling_params_t& params,
                         int64_t latent_x,
                         int64_t latent_y,
-                        float encoding_factor = 1.0f) {
+                        float encoding_factor = 1.0f,
+                        bool circular_x       = false,
+                        bool circular_y       = false) {
         tile_overlap       = std::max(std::min(params.target_overlap, 0.5f), 0.0f);
         auto get_tile_size = [&](int requested_size, float factor, int64_t latent_size) {
             const int default_tile_size  = 32;
@@ -205,6 +207,13 @@ public:
 
         tile_size_x = get_tile_size(params.tile_size_x, params.rel_size_x, latent_x);
         tile_size_y = get_tile_size(params.tile_size_y, params.rel_size_y, latent_y);
+        // Circular axes wrap their tiles instead of pinning the last one to the edge, so they keep the requested size.
+        if (!circular_x) {
+            tile_size_x = sd_tiling_seam_safe_tile_size(static_cast<int>(latent_x), tile_size_x, tile_overlap);
+        }
+        if (!circular_y) {
+            tile_size_y = sd_tiling_seam_safe_tile_size(static_cast<int>(latent_y), tile_size_y, tile_overlap);
+        }
     }
 
     virtual sd::Tensor<float> encode(int n_threads,
@@ -230,7 +239,7 @@ public:
             // tiles to 64 latent pixels so a 512px SD image is encoded as one tile.
             const float encode_tile_factor = sd_version_is_minimax_h3(version) ? 1.f : (sd_version_is_wan(version) || sd_version_is_hunyuan_video(version) || sd_version_is_ltxav(version)) ? 1.30539f
                                                                                                                                                                                             : 2.0f;
-            get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling_params, W, H, encode_tile_factor);
+            get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling_params, W, H, encode_tile_factor, circular_x, circular_y);
             LOG_VERBOSE("VAE Tile size: %dx%d", tile_size_x, tile_size_y);
             output = tiled_compute(input,
                                    n_threads,
@@ -280,7 +289,7 @@ public:
             int64_t H              = input.shape()[1] * scale_factor;
             float tile_overlap;
             int tile_size_x, tile_size_y;
-            get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling_params, input.shape()[0], input.shape()[1]);
+            get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, tiling_params, input.shape()[0], input.shape()[1], 1.0f, circular_x, circular_y);
             if (!silent) {
                 LOG_VERBOSE("VAE Tile size: %dx%d", tile_size_x, tile_size_y);
             }
