@@ -4,6 +4,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <set>
@@ -1175,6 +1176,19 @@ bool StableDiffusionGGML::validate_and_load_runners() {
         diffusion_model->set_flash_attention_enabled(true);
         if (high_noise_diffusion_model) {
             high_noise_diffusion_model->set_flash_attention_enabled(true);
+        }
+    }
+    // The H3 video VAE decoder is a ViT whose f32 L x L attention scores dominate decode time, so on CUDA and ROCm
+    // --diffusion-fa covers it too, without switching the text encoder. It decoded slower on Vulkan, so other
+    // backends keep the old path unless SD_H3_VAE_FLASH_ATTN=1; SD_H3_VAE_FLASH_ATTN=0 restores it everywhere.
+    if (!sd_ctx_params->flash_attn && sd_ctx_params->diffusion_flash_attn && first_stage_model &&
+        sd_version_is_minimax_h3(version)) {
+        const char* env                 = getenv("SD_H3_VAE_FLASH_ATTN");
+        ggml_backend_t vae_backend      = backend_for(SDBackendModule::VAE);
+        const bool fa_faster_by_default = sd_backend_is(vae_backend, "CUDA") || sd_backend_is(vae_backend, "ROCm");
+        if (env != nullptr ? strcmp(env, "0") != 0 : fa_faster_by_default) {
+            LOG_INFO("Using flash attention in the MiniMax-H3 video VAE");
+            first_stage_model->set_flash_attention_enabled(true);
         }
     }
     if (sd_ctx_params->sage_attn && !set_sage_attention_enabled(true)) {

@@ -220,6 +220,12 @@ jobs:
           # (we build with SD_SERVER_BUILD_FRONTEND / SD_WEBP / SD_WEBM off), so fetch only
           # ggml to keep the source tarball small and the build self-contained.
           git submodule update --init --recursive --depth 1 ggml
+          # ggml changes we carry on top of the pinned submodule commit (the submodule points at
+          # leejet/ggml, which we do not push to). A patch that no longer applies fails the build.
+          for p in scripts/unsloth/ggml-patches/*.patch; do
+            [ -e "$p" ] || continue
+            git -C ggml apply --verbose "../$p"
+          done
           COMMIT="$(git rev-parse HEAD)"
           SRC_ARTIFACT="sd-source-${TAG}"
           if [ "$EXISTS" != "true" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
