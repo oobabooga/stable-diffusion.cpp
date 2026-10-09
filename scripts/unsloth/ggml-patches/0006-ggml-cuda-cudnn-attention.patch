@@ -1,4 +1,4 @@
-From 80d308615f1dc9fc601f556123861a651b7cffa5 Mon Sep 17 00:00:00 2001
+From 784b441f8b098863343e69e0345ef62d2ff580af Mon Sep 17 00:00:00 2001
 From: Daniel Han <danielhanchen@gmail.com>
 Date: Sat, 3 Oct 2026 18:27:29 -0700
 Subject: [PATCH] ggml-cuda: optional cuDNN attention for unmasked
@@ -11,7 +11,7 @@ only cudnn.h is needed at build time and libcudnn.so.9 is dlopen'ed on first use
 (GGML_CUDA_CUDNN_LIB overrides the name), so the binary has no cuDNN link
 dependency and runs unchanged where cuDNN is missing.
 
-On NVIDIA sm80+ it takes unmasked, sink/ALiBi/softcap-free attention with equal
+On NVIDIA sm80+ it can take unmasked, sink/ALiBi/softcap-free attention with equal
 Q/K/V head sizes (multiple of 8, up to 256) and at least 2^20 attention scores,
 GQA and batch included, for FLASH_ATTN_EXT and for SAGE_ATTN in AUTO mode (an
 explicitly requested Sage variant keeps its kernel). Q (F32) is narrowed to F16
@@ -22,24 +22,28 @@ kernels' needs). Plans are built once per shape and cached; a shape cuDNN
 declines, a failed build or execute, stream capture, Turing and older, or a
 missing library keep the existing kernels.
 
-GGML_CUDA_CUDNN_ATTN=0 disables it, GGML_CUDA_CUDNN_SAGE=0 keeps the Sage kernel,
-GGML_CUDA_CUDNN_ATTN_BF16=1 runs BF16, GGML_CUDA_CUDNN_ATTN_LOG=1 logs each call.
+By default FLASH_ATTN_EXT takes it on sm89 and sm100 and SAGE_ATTN on sm100,
+where it measured faster; the existing kernels were faster on sm86 (both ops)
+and sm89 (Sage), and other architectures were not measured.
+GGML_CUDA_CUDNN_ATTN=0|1 and GGML_CUDA_CUDNN_SAGE=0|1 turn it off or on for every
+sm80+ GPU, GGML_CUDA_CUDNN_ATTN_BF16=1 runs BF16, GGML_CUDA_CUDNN_ATTN_LOG=1
+logs each call.
 
 test-backend-ops: unmasked cases at the MiniMax-H3 head layout (odd and aligned
 lengths, GQA with batch, F32 K/V, permuted Q) and unmasked perf cases.
 ---
  CMakeLists.txt                     |   3 +
  src/ggml-cuda/CMakeLists.txt       |  49 ++++
- src/ggml-cuda/cudnn-attn-graph.cpp | 258 ++++++++++++++++++++
+ src/ggml-cuda/cudnn-attn-graph.cpp | 258 +++++++++++++++++++
  src/ggml-cuda/cudnn-attn-graph.h   |  31 +++
- src/ggml-cuda/cudnn-attn.cu        | 367 +++++++++++++++++++++++++++++
- src/ggml-cuda/cudnn-attn.cuh       |  25 ++
+ src/ggml-cuda/cudnn-attn.cu        | 384 +++++++++++++++++++++++++++++
+ src/ggml-cuda/cudnn-attn.cuh       |  26 ++
  src/ggml-cuda/fattn.cu             |   7 +-
  src/ggml-cuda/ggml-cuda.cu         |   2 +-
  src/ggml-cuda/sage-attn.cu         |  12 +-
  src/ggml-cuda/sage-attn.cuh        |   2 +-
  tests/test-backend-ops.cpp         |  25 ++
- 11 files changed, 775 insertions(+), 6 deletions(-)
+ 11 files changed, 793 insertions(+), 6 deletions(-)
  create mode 100644 src/ggml-cuda/cudnn-attn-graph.cpp
  create mode 100644 src/ggml-cuda/cudnn-attn-graph.h
  create mode 100644 src/ggml-cuda/cudnn-attn.cu
@@ -427,10 +431,10 @@ index 00000000..9749f2ab
 +                                  void * q, void * k, void * v, void * o, void * workspace);
 diff --git a/src/ggml-cuda/cudnn-attn.cu b/src/ggml-cuda/cudnn-attn.cu
 new file mode 100644
-index 00000000..b54c29af
+index 00000000..a5b9de14
 --- /dev/null
 +++ b/src/ggml-cuda/cudnn-attn.cu
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,384 @@
 +#include "cudnn-attn.cuh"
 +
 +#if defined(GGML_CUDA_USE_CUDNN) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -470,11 +474,20 @@ index 00000000..b54c29af
 +    return t->nb[0] == ggml_type_size(t->type) && t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
 +}
 +
++// -1 when unset, otherwise 0 or 1.
++static int cudnn_attn_env_mode(const char * name) {
++    const char * v = std::getenv(name);
++    if (v == nullptr || v[0] == '\0') {
++        return -1;
++    }
++    return cudnn_attn_env_set(name, true) ? 1 : 0;
++}
++
 +static bool cudnn_attn_make_plan(int device, const ggml_tensor * dst, cudnn_attn_plan & plan) {
-+    static const bool enabled   = cudnn_attn_env_set("GGML_CUDA_CUDNN_ATTN", true);
-+    static const bool sage      = cudnn_attn_env_set("GGML_CUDA_CUDNN_SAGE", true);
++    static const int  attn_mode = cudnn_attn_env_mode("GGML_CUDA_CUDNN_ATTN");
++    static const int  sage_mode = cudnn_attn_env_mode("GGML_CUDA_CUDNN_SAGE");
 +    static const bool want_bf16 = cudnn_attn_env_set("GGML_CUDA_CUDNN_ATTN_BF16", false);
-+    if (!enabled || (dst->op == GGML_OP_SAGE_ATTN && !sage)) {
++    if (attn_mode == 0 || (dst->op == GGML_OP_SAGE_ATTN && sage_mode == 0)) {
 +        return false;
 +    }
 +    if (dst->op != GGML_OP_FLASH_ATTN_EXT && dst->op != GGML_OP_SAGE_ATTN) {
@@ -486,6 +499,14 @@ index 00000000..b54c29af
 +    }
 +    const int cc = ggml_cuda_info().devices[device].cc;
 +    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE) {
++        return false;
++    }
++    // Unset switches keep the existing kernels except where cuDNN measured faster at H3 shapes: against the flash
++    // attention kernel on sm89 and sm100 (slower on sm86), against the Sage kernel on sm100 (slower on sm86 and
++    // sm89). Other architectures were not measured. =1 opts in on any sm80+ GPU.
++    const bool sm100 = cc >= 1000 && cc < GGML_CUDA_CC_BLACKWELL;
++    const bool sm89  = cc >= GGML_CUDA_CC_ADA_LOVELACE && cc < GGML_CUDA_CC_HOPPER;
++    if (dst->op == GGML_OP_SAGE_ATTN ? sage_mode < 0 && !sm100 : attn_mode < 0 && !sm89 && !sm100) {
 +        return false;
 +    }
 +
@@ -800,10 +821,10 @@ index 00000000..b54c29af
 +#endif
 diff --git a/src/ggml-cuda/cudnn-attn.cuh b/src/ggml-cuda/cudnn-attn.cuh
 new file mode 100644
-index 00000000..f59689d5
+index 00000000..067bea63
 --- /dev/null
 +++ b/src/ggml-cuda/cudnn-attn.cuh
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,26 @@
 +#pragma once
 +
 +#include "common.cuh"
@@ -814,10 +835,11 @@ index 00000000..f59689d5
 +// least 2^20 attention scores is taken; everything else, and every shape cuDNN rejects, keeps the
 +// existing kernels.
 +//
++// By default FLASH_ATTN_EXT takes it on sm89 and sm100 and SAGE_ATTN on sm100, where it measured faster.
 +// Environment:
-+//   GGML_CUDA_CUDNN_ATTN=0       never use cuDNN for attention
-+//   GGML_CUDA_CUDNN_SAGE=0       keep the SageAttention kernels for GGML_OP_SAGE_ATTN (AUTO mode;
-+//                                an explicitly requested Sage variant always keeps its kernel)
++//   GGML_CUDA_CUDNN_ATTN=0|1     never use cuDNN for attention / use it on every sm80+ GPU
++//   GGML_CUDA_CUDNN_SAGE=0|1     keep the SageAttention kernels for GGML_OP_SAGE_ATTN / use cuDNN on every
++//                                sm80+ GPU (AUTO mode; an explicitly requested Sage variant keeps its kernel)
 +//   GGML_CUDA_CUDNN_ATTN_BF16=1  run cuDNN in BF16 instead of F16 (F16 K/V are narrowed)
 +//   GGML_CUDA_CUDNN_LIB=path     library to open instead of libcudnn.so.9
 +//   GGML_CUDA_CUDNN_ATTN_LOG=1   log every call that takes (or falls back from) the cuDNN path
