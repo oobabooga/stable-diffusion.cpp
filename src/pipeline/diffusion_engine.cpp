@@ -2960,8 +2960,7 @@ sd::Tensor<float> StableDiffusionGGML::decode_first_stage(const sd::Tensor<float
                                                latents.shape()[0], latents.shape()[1], circular_x, circular_y)) {
             return {};
         }
-        // get_tile_sizes can widen a retry tile to keep the overlap, so stop once a spatial retry no longer
-        // shrinks it (a temporal retry keeps the spatial tiles).
+        // get_tile_sizes can widen a retry tile, so stop once a spatial retry no longer shrinks it.
         if (tile_size_w == last_w && tile_size_h == last_h) {
             return {};
         }

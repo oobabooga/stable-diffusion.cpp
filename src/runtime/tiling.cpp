@@ -61,11 +61,9 @@ static std::vector<TileSpan> sd_tiling_plan_axis(int dimension,
 }
 
 int sd_tiling_seam_safe_tile_size(int small_dim, int tile_size, float tile_overlap_factor) {
-    // The planner keeps adjacent tiles overlapping but never lets three tiles cover one point, so a tile a little
-    // over half of the axis (e.g. 32 of 62 latents) still gets two tiles that overlap by 2 * tile_size - small_dim,
-    // a latent or two: the cross-fade has nothing to blend over and the tile edge shows as a line. Pick the nearest
-    // tile size (smaller first; a larger one only up to twice the request, so an explicitly small tile cannot
-    // balloon) whose tiles all overlap by at least half the target and by 2+ latents.
+    // A tile a little over half the axis (32 of 62 latents) gets two tiles overlapping by 1-2 latents, which shows
+    // as a seam. Pick the nearest size (smaller first, larger only up to 2x) whose overlaps are >= half the target
+    // and >= 2 latents.
     const int min_tile_size = 4;
     if (tile_overlap_factor <= 0.f || tile_size >= small_dim) {
         return tile_size;
@@ -178,8 +176,7 @@ static void sd_tensor_merge_2d(const float* input_data,
     auto smootherstep_f32 = [](const float x) -> float {
         return x * x * x * (x * (6.0f * x - 15.0f) + 10.0f);
     };
-    // The weights depend only on the column or the row, so they are computed once per tile; every element
-    // still gets the same arithmetic in the same order as a per-element computation.
+    // Weights depend only on the column or row; the per-element arithmetic order is unchanged.
     std::vector<float> x_weights(static_cast<size_t>(in_width));
     std::vector<float> y_weights(static_cast<size_t>(in_height));
     std::vector<int64_t> dst_x(static_cast<size_t>(in_width));
